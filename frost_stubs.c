@@ -1,0 +1,558 @@
+/* frost_stubs.c — drop-in replacement for the five stub functions
+ * in frost_signer.c.
+ *
+ * Replace the five static stub functions in frost_signer.c with the
+ * contents of this file (or #include it before main()).
+ *
+ * Each function calls the Rust frost_signer_core binary via popen(),
+ * writes inputs on stdin, and reads outputs from stdout.
+ *
+ * Wire protocol: hex-encoded lines, matching src/main.rs exactly.
+ *
+ * FROST_CORE_BIN can be overridden at compile time:
+ *   gcc ... -DFROST_CORE_BIN=\"/usr/local/bin/frost_signer_core\" ...
+ */
+
+#ifndef FROST_CORE_BIN
+#define FROST_CORE_BIN "./frost_signer_core/target/debug/frost_signer_core"
+#endif
+
+// #include <errno.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include "frost_common.h"
+
+/* ── hex helpers ──────────────────────────────────────────────── */
+
+static void bytes_to_hex(const uint8_t *bytes, size_t len, char *out) {
+  static const char hex[] = "0123456789abcdef";
+  for (size_t i = 0; i < len; i++) {
+    out[2 * i] = hex[(bytes[i] >> 4) & 0xF];
+    out[2 * i + 1] = hex[bytes[i] & 0xF];
+  }
+  out[2 * len] = '\0';
+}
+
+static void print_bytes_as_hex(const uint8_t *bytes, size_t len) {
+  char hex[FROST_MAX_PAYLOAD] = {'\0'};
+  bytes_to_hex(bytes, len, hex);
+  printf("%s\n", hex);
+}
+
+/* Returns number of bytes decoded, or -1 on error. */
+static int hex_to_bytes(const char *hex, uint8_t *out, size_t max_out) {
+  size_t hexlen = strlen(hex);
+  /* strip trailing newline/space */
+  while (hexlen > 0 && (hex[hexlen - 1] == '\n' || hex[hexlen - 1] == '\r' ||
+                        hex[hexlen - 1] == ' '))
+    hexlen--;
+
+  if (hexlen % 2 != 0)
+    return -1;
+  size_t nbytes = hexlen / 2;
+  if (nbytes > max_out)
+    return -1;
+
+  for (size_t i = 0; i < nbytes; i++) {
+    unsigned int hi, lo;
+    char h[3] = {hex[2 * i], hex[2 * i + 1], '\0'};
+    if (sscanf(h, "%1x%1x", &hi, &lo) != 2)
+      return -1;
+    out[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return (int)nbytes;
+}
+
+/* ── popen helper: write stdin, read one stdout line ────────────
+ *
+ * cmd      — full shell command string
+ * stdin_data — bytes to pipe into stdin (NULL if none)
+ * stdin_len  — length of stdin_data
+ * line_out   — buffer to receive one line of stdout
+ * line_max   — size of line_out
+ *
+ * Returns 0 on success, -1 on error.
+ */
+static int popen_roundtrip(const char *cmd, const char *stdin_data,
+                           size_t stdin_len, char *line_out, size_t line_max) {
+  /* We need bidirectional popen.  POSIX only gives us one direction,
+   * so we write stdin via a temp file and read stdout via popen("r"). */
+
+  /* Write stdin to a temp file */
+  char tmpfile[] = "/tmp/frost_stdin_XXXXXX";
+  int tmpfd = mkstemp(tmpfile);
+  if (tmpfd < 0) {
+    perror("frost_stubs: mkstemp");
+    return -1;
+  }
+  if (stdin_data && stdin_len > 0) {
+    if (write(tmpfd, stdin_data, stdin_len) < 0) {
+      perror("frost_stubs: write tmpfile");
+      close(tmpfd);
+      unlink(tmpfile);
+      return -1;
+    }
+  }
+  close(tmpfd);
+
+  /* Build command: feed tmpfile as stdin */
+  char full_cmd[4096];
+  snprintf(full_cmd, sizeof(full_cmd), "%s < %s", cmd, tmpfile);
+
+  FILE *fp = popen(full_cmd, "r");
+  if (!fp) {
+    perror("frost_stubs: popen");
+    unlink(tmpfile);
+    return -1;
+  }
+
+  if (fgets(line_out, (int)line_max, fp) == NULL) {
+    fprintf(stderr, "frost_stubs: no output from: %s\n", full_cmd);
+    pclose(fp);
+    unlink(tmpfile);
+    return -1;
+  }
+
+  int exit_code = pclose(fp);
+  unlink(tmpfile);
+
+  if (exit_code != 0) {
+    fprintf(stderr, "frost_stubs: command exited %d: %s\n", exit_code,
+            full_cmd);
+    return -1;
+  }
+  return 0;
+}
+
+/* ── Full bidirectional popen: write N input lines, read M output lines ──
+ *
+ * stdin_lines  — array of strings to write (each gets a '\n' appended)
+ * n_in         — number of input lines
+ * stdout_lines — array of buffers to receive output lines
+ * line_maxes   — size of each output buffer
+ * n_out        — number of output lines to read
+ *
+ * Returns 0 on success, -1 on error.
+ */
+static int popen_multi(const char *cmd, const char *stdin_lines[], int n_in,
+                       char *stdout_lines[], const size_t line_maxes[],
+                       int n_out) {
+  /* Build full stdin content */
+  char stdin_buf[FROST_MAX_PAYLOAD * FROST_MAX_SIGNERS * 3];
+  size_t off = 0;
+  for (int i = 0; i < n_in; i++) {
+    size_t len = strlen(stdin_lines[i]);
+    if (off + len + 2 > sizeof(stdin_buf)) {
+      fprintf(stderr, "frost_stubs: stdin buffer overflow\n");
+      return -1;
+    }
+    memcpy(stdin_buf + off, stdin_lines[i], len);
+    off += len;
+    stdin_buf[off++] = '\n';
+  }
+  stdin_buf[off] = '\0';
+
+  /* Write to temp file */
+  char tmpfile[] = "/tmp/frost_stdin_XXXXXX";
+  int tmpfd = mkstemp(tmpfile);
+  if (tmpfd < 0) {
+    perror("mkstemp");
+    return -1;
+  }
+  if (off > 0 && write(tmpfd, stdin_buf, off) < 0) {
+    perror("write tmpfile");
+    close(tmpfd);
+    unlink(tmpfile);
+    return -1;
+  }
+  close(tmpfd);
+
+  char full_cmd[4096];
+  snprintf(full_cmd, sizeof(full_cmd), "%s < %s", cmd, tmpfile);
+
+  printf("signer: `%s`\n", full_cmd);
+
+  FILE *fp = popen(full_cmd, "r");
+  if (!fp) {
+    perror("popen");
+    unlink(tmpfile);
+    return -1;
+  }
+
+  for (int i = 0; i < n_out; i++) {
+    if (fgets(stdout_lines[i], (int)line_maxes[i], fp) == NULL) {
+      fprintf(stderr, "frost_stubs: EOF reading output line %d\n", i);
+      pclose(fp);
+      unlink(tmpfile);
+      return -1;
+    }
+    /* strip trailing newline */
+    size_t slen = strlen(stdout_lines[i]);
+    if (slen > 0 && stdout_lines[i][slen - 1] == '\n')
+      stdout_lines[i][slen - 1] = '\0';
+
+    /* check for ERROR: prefix */
+    if (strncmp(stdout_lines[i], "ERROR:", 6) == 0) {
+      fprintf(stderr, "frost_stubs: Rust error: %s\n", stdout_lines[i]);
+      pclose(fp);
+      unlink(tmpfile);
+      return -1;
+    }
+  }
+
+  int exit_code = pclose(fp);
+  unlink(tmpfile);
+  if (exit_code != 0) {
+    fprintf(stderr, "frost_stubs: command failed (exit %d): %s\n", exit_code,
+            full_cmd);
+    return -1;
+  }
+  return 0;
+}
+
+/* ── Per-call hex line buffers ──────────────────────────────────── */
+/* Each hex line can be at most 2*FROST_MAX_PAYLOAD chars + '\0'    */
+#define HEX_LINE_MAX (FROST_MAX_PAYLOAD * 2 + 4)
+
+/* ═══════════════════════════════════════════════════════════════
+ * frost_dkg_part1
+ * ═══════════════════════════════════════════════════════════════ */
+static int frost_dkg_part1(uint16_t id, uint16_t n, uint16_t t,
+                           uint8_t *secret_out, uint16_t *secret_len,
+                           uint8_t *pkg_out, uint16_t *pkg_len) {
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " dkg_part1 --id %u --n %u --t %u",
+           (unsigned)id, (unsigned)n, (unsigned)t);
+
+  static char secret_hex[HEX_LINE_MAX];
+  static char pkg_hex[HEX_LINE_MAX];
+  char *out_lines[2] = {secret_hex, pkg_hex};
+  size_t out_maxes[2] = {HEX_LINE_MAX, HEX_LINE_MAX};
+
+  if (popen_multi(cmd, NULL, 0, out_lines, out_maxes, 2) != 0)
+    return -1;
+
+  int slen = hex_to_bytes(secret_hex, secret_out, FROST_MAX_PAYLOAD);
+  int plen = hex_to_bytes(pkg_hex, pkg_out, FROST_MAX_PAYLOAD);
+  if (slen < 0 || plen < 0) {
+    fprintf(stderr, "frost_stubs: dkg_part1 hex decode failed\n");
+    return -1;
+  }
+  *secret_len = (uint16_t)slen;
+  *pkg_len = (uint16_t)plen;
+
+  printf("signer %u: dkg_part1 ok — secret=%u bytes, pkg=%u bytes\n",
+         (unsigned)id, *secret_len, *pkg_len);
+  return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * frost_dkg_part2
+ * ═══════════════════════════════════════════════════════════════ */
+static int frost_dkg_part2(uint16_t my_id, const uint8_t *r1_secret,
+                           uint16_t r1_secret_len,
+                           const uint8_t peer_r1[][FROST_MAX_PAYLOAD],
+                           const uint16_t peer_r1_lens[],
+                           const uint16_t peer_r1_ids[], int n_peers,
+                           uint8_t *r2_secret_out, uint16_t *r2_secret_len,
+                           uint8_t peer_r2_out[][FROST_MAX_PAYLOAD],
+                           uint16_t peer_r2_lens[], uint16_t peer_r2_ids[]) {
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " dkg_part2 --id %u --n %u",
+           (unsigned)my_id, (unsigned)(n_peers + 1));
+
+  /* Build stdin: line 1 = r1 secret hex, then n_peers peer r1 lines */
+  /* We need 1 + n_peers input lines */
+  int n_in = 1 + n_peers;
+  const char **in_lines = malloc((size_t)n_in * sizeof(char *));
+  char **in_bufs = malloc((size_t)n_in * sizeof(char *));
+  if (!in_lines || !in_bufs) {
+    free(in_lines);
+    free(in_bufs);
+    return -1;
+  }
+
+  /* line 0: r1 secret */
+  in_bufs[0] = malloc(HEX_LINE_MAX);
+  bytes_to_hex(r1_secret, r1_secret_len, in_bufs[0]);
+  in_lines[0] = in_bufs[0];
+
+  /* lines 1..n_peers: "<sender_id> <hex(r1_pkg)>" */
+  for (int i = 0; i < n_peers; i++) {
+    in_bufs[1 + i] = malloc(HEX_LINE_MAX + 8);
+    char pkg_hex[HEX_LINE_MAX];
+    bytes_to_hex(peer_r1[i], peer_r1_lens[i], pkg_hex);
+    snprintf(in_bufs[1 + i], HEX_LINE_MAX + 8, "%u %s",
+             (unsigned)peer_r1_ids[i], pkg_hex);
+    in_lines[1 + i] = in_bufs[1 + i];
+  }
+
+  /* Output: line 0 = r2 secret, lines 1..n_peers = "<target_id> <hex>" */
+  int n_out = 1 + n_peers;
+  char **out_bufs = malloc((size_t)n_out * sizeof(char *));
+  char **out_lines = malloc((size_t)n_out * sizeof(char *));
+  size_t *out_maxes = malloc((size_t)n_out * sizeof(size_t));
+  if (!out_bufs || !out_lines || !out_maxes) {
+    /* cleanup and bail */
+    for (int i = 0; i < n_in; i++)
+      free(in_bufs[i]);
+    free(in_lines);
+    free(in_bufs);
+    free(out_bufs);
+    free(out_lines);
+    free(out_maxes);
+    return -1;
+  }
+  for (int i = 0; i < n_out; i++) {
+    out_bufs[i] = malloc(HEX_LINE_MAX + 8);
+    out_lines[i] = out_bufs[i];
+    out_maxes[i] = HEX_LINE_MAX + 8;
+  }
+
+  int rc = popen_multi(cmd, in_lines, n_in, out_lines, out_maxes, n_out);
+
+  for (int i = 0; i < n_in; i++)
+    free(in_bufs[i]);
+  free(in_lines);
+  free(in_bufs);
+
+  if (rc != 0) {
+    for (int i = 0; i < n_out; i++)
+      free(out_bufs[i]);
+    free(out_bufs);
+    free(out_lines);
+    free(out_maxes);
+    return -1;
+  }
+
+  /* decode r2 secret (line 0) */
+  int slen = hex_to_bytes(out_bufs[0], r2_secret_out, FROST_MAX_PAYLOAD);
+  if (slen < 0) {
+    fprintf(stderr, "frost_stubs: dkg_part2 r2 secret hex decode failed\n");
+    for (int i = 0; i < n_out; i++)
+      free(out_bufs[i]);
+    free(out_bufs);
+    free(out_lines);
+    free(out_maxes);
+    return -1;
+  }
+  *r2_secret_len = (uint16_t)slen;
+
+  /* decode r2 packages (lines 1..n_peers) */
+  for (int i = 0; i < n_peers; i++) {
+    char *line = out_bufs[1 + i];
+    /* format: "<target_id> <hex>" */
+    unsigned int tid = 0;
+    char *space = strchr(line, ' ');
+    if (!space) {
+      fprintf(stderr, "frost_stubs: dkg_part2 bad r2 line: %s\n", line);
+      for (int j = 0; j < n_out; j++)
+        free(out_bufs[j]);
+      free(out_bufs);
+      free(out_lines);
+      free(out_maxes);
+      return -1;
+    }
+    *space = '\0';
+    sscanf(line, "%u", &tid);
+    peer_r2_ids[i] = (uint16_t)tid;
+    int plen = hex_to_bytes(space + 1, peer_r2_out[i], FROST_MAX_PAYLOAD);
+    if (plen < 0) {
+      fprintf(stderr, "frost_stubs: dkg_part2 r2 pkg hex decode failed\n");
+      for (int j = 0; j < n_out; j++)
+        free(out_bufs[j]);
+      free(out_bufs);
+      free(out_lines);
+      free(out_maxes);
+      return -1;
+    }
+    peer_r2_lens[i] = (uint16_t)plen;
+  }
+
+  for (int i = 0; i < n_out; i++)
+    free(out_bufs[i]);
+  free(out_bufs);
+  free(out_lines);
+  free(out_maxes);
+
+  printf("signer %u: dkg_part2 ok — %d r2 packages\n", (unsigned)my_id,
+         n_peers);
+  return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * frost_dkg_part3
+ * ═══════════════════════════════════════════════════════════════ */
+static int
+frost_dkg_part3(uint16_t my_id, const uint8_t *r2_secret,
+                uint16_t r2_secret_len,
+                const uint8_t peer_r1[][FROST_MAX_PAYLOAD],
+                const uint16_t peer_r1_lens[], const uint16_t peer_r1_ids[],
+                int n_r1, const uint8_t peer_r2[][FROST_MAX_PAYLOAD],
+                const uint16_t peer_r2_lens[], const uint16_t peer_r2_ids[],
+                int n_r2, uint8_t *key_pkg_out, uint16_t *key_pkg_len,
+                uint8_t *pub_key_pkg_out, uint16_t *pub_key_pkg_len) {
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " dkg_part3 --id %u --n %u --t 0",
+           (unsigned)my_id, (unsigned)(n_r1 + 1));
+
+  /* stdin: r2_secret, then n_r1 r1 lines, then n_r2 r2 lines */
+  int n_in = 1 + n_r1 + n_r2;
+  char **in_bufs = malloc((size_t)n_in * sizeof(char *));
+  const char **in_lines = malloc((size_t)n_in * sizeof(char *));
+  if (!in_bufs || !in_lines) {
+    free(in_bufs);
+    free(in_lines);
+    return -1;
+  }
+
+  int idx = 0;
+
+  in_bufs[idx] = malloc(HEX_LINE_MAX);
+  bytes_to_hex(r2_secret, r2_secret_len, in_bufs[idx]);
+  in_lines[idx] = in_bufs[idx];
+  idx++;
+
+  /* peer r1 packages — we stored sender IDs in g_peer_r1_ids[] in
+   * frost_signer.c, but that array isn't passed here.  The C caller
+   * must pass them via a wrapper.  For now use sequential IDs
+   * excluding my_id (matches the order they arrived). */
+  for (int i = 0; i < n_r1; i++) {
+    in_bufs[idx] = malloc(HEX_LINE_MAX + 8);
+    char pkg_hex[HEX_LINE_MAX];
+    bytes_to_hex(peer_r1[i], peer_r1_lens[i], pkg_hex);
+    /* sender ID: reconstruct from position (caller fills g_peer_r1_ids) */
+    snprintf(in_bufs[idx], HEX_LINE_MAX + 8, "%u %s", (unsigned)peer_r1_ids[i],
+             pkg_hex); /* patched below */
+    in_lines[idx] = in_bufs[idx];
+    idx++;
+  }
+
+  for (int i = 0; i < n_r2; i++) {
+    in_bufs[idx] = malloc(HEX_LINE_MAX + 8);
+    char pkg_hex[HEX_LINE_MAX];
+    bytes_to_hex(peer_r2[i], peer_r2_lens[i], pkg_hex);
+    snprintf(in_bufs[idx], HEX_LINE_MAX + 8, "%u %s", (unsigned)peer_r2_ids[i],
+             pkg_hex); /* patched below */
+    in_lines[idx] = in_bufs[idx];
+    idx++;
+  }
+
+  /* 2 output lines: KeyPackage, PublicKeyPackage */
+  char key_hex[HEX_LINE_MAX], pub_hex[HEX_LINE_MAX];
+  char *out_lines[2] = {key_hex, pub_hex};
+  size_t out_maxes[2] = {HEX_LINE_MAX, HEX_LINE_MAX};
+
+  int rc = popen_multi(cmd, in_lines, n_in, out_lines, out_maxes, 2);
+
+  for (int i = 0; i < n_in; i++)
+    free(in_bufs[i]);
+  free(in_bufs);
+  free(in_lines);
+  if (rc != 0)
+    return -1;
+
+  int klen = hex_to_bytes(key_hex, key_pkg_out, FROST_MAX_PAYLOAD);
+  if (klen < 0) {
+    fprintf(stderr, "frost_stubs: dkg_part3 key pkg hex decode failed\n");
+    return -1;
+  }
+  *key_pkg_len = (uint16_t)klen;
+
+  /* PublicKeyPackage is available here too if the caller wants it;
+   * pub_hex contains it.  For SSH CA use, extract the verifying_key
+   * by calling:  frost_signer_core pubkey < pub_hex_file  */
+  int plen = hex_to_bytes(pub_hex, pub_key_pkg_out, FROST_MAX_PAYLOAD);
+  if (plen < 0) {
+    fprintf(stderr, "frost_stubs: dkg_part3 pub key pkg hex decode failed\n");
+  }
+  *pub_key_pkg_len = (uint16_t)plen;
+
+  printf("signer %u: dkg_part3 ok — key_pkg=%u bytes, pub_key_pkg=%u bytes\n",
+         (unsigned)my_id, *key_pkg_len, *pub_key_pkg_len);
+
+  // printf("signer %u: dkg_part3 ok — key_pkg=%u bytes\n", (unsigned)my_id,
+  //       *key_pkg_len);
+  return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * frost_commit
+ * ═══════════════════════════════════════════════════════════════ */
+static int frost_commit(uint16_t my_id, const uint8_t *key_pkg,
+                        uint16_t key_pkg_len, uint8_t *nonces_out,
+                        uint16_t *nonces_len, uint8_t *commit_out,
+                        uint16_t *commit_len) {
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " commit --id %u", (unsigned)my_id);
+
+  /* stdin: KeyPackage hex */
+  char key_hex[HEX_LINE_MAX];
+  bytes_to_hex(key_pkg, key_pkg_len, key_hex);
+  const char *in_lines[1] = {key_hex};
+
+  char nonces_hex[HEX_LINE_MAX], commit_hex[HEX_LINE_MAX];
+  char *out_lines[2] = {nonces_hex, commit_hex};
+  size_t out_maxes[2] = {HEX_LINE_MAX, HEX_LINE_MAX};
+
+  if (popen_multi(cmd, in_lines, 1, out_lines, out_maxes, 2) != 0)
+    return -1;
+
+  int nlen = hex_to_bytes(nonces_hex, nonces_out, FROST_MAX_PAYLOAD);
+  int clen = hex_to_bytes(commit_hex, commit_out, FROST_MAX_PAYLOAD);
+  if (nlen < 0 || clen < 0) {
+    fprintf(stderr, "frost_stubs: commit hex decode failed\n");
+    return -1;
+  }
+  *nonces_len = (uint16_t)nlen;
+  *commit_len = (uint16_t)clen;
+
+  printf("signer %u: commit ok — nonces=%u bytes, commit=%u bytes\n",
+         (unsigned)my_id, *nonces_len, *commit_len);
+  return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+ * frost_sign
+ * ═══════════════════════════════════════════════════════════════ */
+static int frost_sign(uint16_t my_id, const uint8_t *signing_pkg,
+                      uint16_t signing_pkg_len, const uint8_t *nonces,
+                      uint16_t nonces_len, const uint8_t *key_pkg,
+                      uint16_t key_pkg_len, uint8_t *sig_share_out,
+                      uint16_t *sig_share_len) {
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " sign --id %u", (unsigned)my_id);
+
+  char nonces_hex[HEX_LINE_MAX], key_hex[HEX_LINE_MAX],
+      signing_hex[HEX_LINE_MAX];
+  bytes_to_hex(nonces, nonces_len, nonces_hex);
+  bytes_to_hex(key_pkg, key_pkg_len, key_hex);
+  bytes_to_hex(signing_pkg, signing_pkg_len, signing_hex);
+
+  /* stdin order must match cmd_sign() in main.rs:
+   *   line 1 — nonces
+   *   line 2 — key_pkg
+   *   line 3 — signing_pkg  */
+  const char *in_lines[3] = {nonces_hex, key_hex, signing_hex};
+
+  char share_hex[HEX_LINE_MAX];
+  char *out_lines[1] = {share_hex};
+  size_t out_maxes[1] = {HEX_LINE_MAX};
+
+  if (popen_multi(cmd, in_lines, 3, out_lines, out_maxes, 1) != 0)
+    return -1;
+
+  int slen = hex_to_bytes(share_hex, sig_share_out, FROST_MAX_PAYLOAD);
+  if (slen < 0) {
+    fprintf(stderr, "frost_stubs: sign hex decode failed\n");
+    return -1;
+  }
+  *sig_share_len = (uint16_t)slen;
+
+  printf("signer %u: sign ok — share=%u bytes\n", (unsigned)my_id,
+         *sig_share_len);
+  return 0;
+}
