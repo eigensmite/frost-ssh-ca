@@ -479,6 +479,194 @@ frost_dkg_part3(uint16_t my_id, const uint8_t *r2_secret,
   return 0;
 }
 
+/* ── frost_refresh_part1 ──────────────────────────────────────────
+ * Calls refresh_part1 --id <id> --n <n> --t <t>.
+ * Output: round1 secret package and round1 broadcast package.
+ * Wire format identical to frost_dkg_part1.                       */
+static int frost_refresh_part1(uint16_t my_id, uint16_t n, uint16_t t,
+                               uint8_t *r1_secret_out,
+                               uint16_t *r1_secret_len_out, uint8_t *r1_pkg_out,
+                               uint16_t *r1_pkg_len_out) {
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd),
+           FROST_CORE_BIN " refresh_part1 --id %u --n %u --t %u",
+           (unsigned)my_id, (unsigned)n, (unsigned)t);
+
+  const char *in_lines[] = {NULL};
+  static char rf1_buf0[HEX_LINE_MAX + 1];
+  static char rf1_buf1[HEX_LINE_MAX + 1];
+  char *out_lines[2] = {rf1_buf0, rf1_buf1};
+  size_t maxes_2[2] = {HEX_LINE_MAX, HEX_LINE_MAX};
+  if (popen_multi(cmd, in_lines, 0, out_lines, maxes_2, 2) != 0) {
+    fprintf(stderr, "frost_stubs: refresh_part1 failed\n");
+    return -1;
+  }
+
+  int r1s_len = hex_to_bytes(out_lines[0], r1_secret_out, FROST_MAX_PAYLOAD);
+  int r1p_len = hex_to_bytes(out_lines[1], r1_pkg_out, FROST_MAX_PAYLOAD);
+
+  if (r1s_len < 0 || r1p_len < 0) {
+    fprintf(stderr, "frost_stubs: refresh_part1 hex decode failed\n");
+    return -1;
+  }
+  *r1_secret_len_out = (uint16_t)r1s_len;
+  *r1_pkg_len_out = (uint16_t)r1p_len;
+  return 0;
+}
+
+/* ── frost_refresh_part2 ──────────────────────────────────────────
+ * Calls refresh_part2 --id <id>.
+ * Wire format identical to frost_dkg_part2.                       */
+static int frost_refresh_part2(
+    uint16_t my_id, const uint8_t *r1_secret, uint16_t r1_secret_len,
+    const uint8_t peer_r1[][FROST_MAX_PAYLOAD], const uint16_t *peer_r1_lens,
+    const uint16_t *peer_r1_ids, int n_r1, uint8_t *r2_secret_out,
+    uint16_t *r2_secret_len_out, uint8_t r2_out[][FROST_MAX_PAYLOAD],
+    uint16_t *r2_lens, uint16_t *r2_ids) {
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " refresh_part2 --id %u",
+           (unsigned)my_id);
+
+  /* Build input: r1_secret hex, then "<id> <r1_pkg hex>" per peer */
+  char r1_secret_hex[FROST_MAX_PAYLOAD * 2 + 2];
+  bytes_to_hex(r1_secret, r1_secret_len, r1_secret_hex);
+
+  static char peer_lines[FROST_MAX_SIGNERS][FROST_MAX_PAYLOAD * 2 + 32];
+  const char *in_lines[FROST_MAX_SIGNERS + 2];
+  in_lines[0] = r1_secret_hex;
+  for (int i = 0; i < n_r1; i++) {
+    char hex[FROST_MAX_PAYLOAD * 2 + 2];
+    bytes_to_hex(peer_r1[i], peer_r1_lens[i], hex);
+    snprintf(peer_lines[i], sizeof(peer_lines[i]), "%u %s",
+             (unsigned)peer_r1_ids[i], hex);
+    in_lines[i + 1] = peer_lines[i];
+  }
+  in_lines[n_r1 + 1] = NULL;
+
+  /* Output: r2_secret hex, then "<id> <r2_pkg hex>" per peer */
+  // char *out_lines[FROST_MAX_SIGNERS + 2];
+  // memset(out_lines, 0, sizeof(out_lines));
+  static char rf2_bufs[FROST_MAX_SIGNERS + 2][HEX_LINE_MAX + 1];
+  char *out_lines[FROST_MAX_SIGNERS + 2];
+  for (int mi = 0; mi < n_r1 + 1; mi++)
+    out_lines[mi] = rf2_bufs[mi];
+
+  size_t maxes_r2[FROST_MAX_SIGNERS + 2];
+  for (int mi = 0; mi < n_r1 + 1; mi++)
+    maxes_r2[mi] = HEX_LINE_MAX;
+  if (popen_multi(cmd, in_lines, n_r1 + 1, out_lines, maxes_r2, n_r1 + 1) !=
+      0) {
+    fprintf(stderr, "frost_stubs: refresh_part2 failed\n");
+    return -1;
+  }
+
+  int r2s_len = hex_to_bytes(out_lines[0], r2_secret_out, FROST_MAX_PAYLOAD);
+  // free(out_lines[0]);
+  if (r2s_len < 0) {
+    return -1;
+  }
+  *r2_secret_len_out = (uint16_t)r2s_len;
+
+  for (int i = 0; i < n_r1; i++) {
+    if (!out_lines[i + 1])
+      return -1;
+    char *sp = strchr(out_lines[i + 1], ' ');
+    if (!sp) {
+      // free(out_lines[i + 1]);
+      return -1;
+    }
+    *sp = '\0';
+    r2_ids[i] = (uint16_t)atoi(out_lines[i + 1]);
+    int r2len = hex_to_bytes(sp + 1, r2_out[i], FROST_MAX_PAYLOAD);
+    // free(out_lines[i + 1]);
+    if (r2len < 0)
+      return -1;
+    r2_lens[i] = (uint16_t)r2len;
+  }
+  return 0;
+}
+
+/* ── frost_refresh_shares ─────────────────────────────────────────
+ * Calls refresh_shares --n <n>.
+ * Passes old KeyPackage and PublicKeyPackage as the final two stdin
+ * lines; receives new KeyPackage and PublicKeyPackage on stdout.
+ *
+ * The group verifying key is guaranteed unchanged by the Rust binary.*/
+static int frost_refresh_shares(
+    uint16_t my_id, uint16_t n, const uint8_t *r2_secret,
+    uint16_t r2_secret_len, const uint8_t peer_r1[][FROST_MAX_PAYLOAD],
+    const uint16_t *peer_r1_lens, const uint16_t *peer_r1_ids, int n_r1,
+    const uint8_t peer_r2[][FROST_MAX_PAYLOAD], const uint16_t *peer_r2_lens,
+    const uint16_t *peer_r2_ids, int n_r2, const uint8_t *old_key_pkg,
+    uint16_t old_key_pkg_len, const uint8_t *old_pub_key_pkg,
+    uint16_t old_pub_key_pkg_len, uint8_t *new_key_pkg_out,
+    uint16_t *new_key_pkg_len_out, uint8_t *new_pub_key_pkg_out,
+    uint16_t *new_pub_key_pkg_len_out) {
+  (void)my_id;
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " refresh_shares --n %u",
+           (unsigned)n);
+
+  /* Build stdin:
+   *   line 0:         hex(r2_secret)
+   *   lines 1..n_r1:  "<id> <hex(r1_pkg)>"
+   *   lines n_r1+1..n_r1+n_r2:  "<id> <hex(r2_pkg)>"
+   *   line n_r1+n_r2+1: hex(old_pub_key_pkg)
+   *   line n_r1+n_r2+2: hex(old_key_pkg)          */
+  static char r2_secret_hex_buf[FROST_MAX_PAYLOAD * 2 + 2];
+  static char peer_r1_lines[FROST_MAX_SIGNERS][FROST_MAX_PAYLOAD * 2 + 32];
+  static char peer_r2_lines[FROST_MAX_SIGNERS][FROST_MAX_PAYLOAD * 2 + 32];
+  static char old_pub_hex[FROST_MAX_PAYLOAD * 2 + 2];
+  static char old_key_hex[FROST_MAX_PAYLOAD * 2 + 2];
+
+  bytes_to_hex(r2_secret, r2_secret_len, r2_secret_hex_buf);
+  bytes_to_hex(old_pub_key_pkg, old_pub_key_pkg_len, old_pub_hex);
+  bytes_to_hex(old_key_pkg, old_key_pkg_len, old_key_hex);
+
+  const char *in_lines[FROST_MAX_SIGNERS * 2 + 8];
+  int idx = 0;
+  in_lines[idx++] = r2_secret_hex_buf;
+  for (int i = 0; i < n_r1; i++) {
+    char hex[FROST_MAX_PAYLOAD * 2 + 2];
+    bytes_to_hex(peer_r1[i], peer_r1_lens[i], hex);
+    snprintf(peer_r1_lines[i], sizeof(peer_r1_lines[i]), "%u %s",
+             (unsigned)peer_r1_ids[i], hex);
+    in_lines[idx++] = peer_r1_lines[i];
+  }
+  for (int i = 0; i < n_r2; i++) {
+    char hex[FROST_MAX_PAYLOAD * 2 + 2];
+    bytes_to_hex(peer_r2[i], peer_r2_lens[i], hex);
+    snprintf(peer_r2_lines[i], sizeof(peer_r2_lines[i]), "%u %s",
+             (unsigned)peer_r2_ids[i], hex);
+    in_lines[idx++] = peer_r2_lines[i];
+  }
+  in_lines[idx++] = old_pub_hex;
+  in_lines[idx++] = old_key_hex;
+  in_lines[idx] = NULL;
+
+  static char rfs_buf0[HEX_LINE_MAX + 1];
+  static char rfs_buf1[HEX_LINE_MAX + 1];
+  char *out_lines[2] = {rfs_buf0, rfs_buf1};
+  size_t maxes_rs[2] = {HEX_LINE_MAX, HEX_LINE_MAX};
+  if (popen_multi(cmd, in_lines, idx, out_lines, maxes_rs, 2) != 0) {
+    fprintf(stderr, "frost_stubs: refresh_shares failed\n");
+    return -1;
+  }
+
+  int klen = hex_to_bytes(out_lines[0], new_key_pkg_out, FROST_MAX_PAYLOAD);
+  int plen = hex_to_bytes(out_lines[1], new_pub_key_pkg_out, FROST_MAX_PAYLOAD);
+  // free(out_lines[0]);
+  // free(out_lines[1]);
+
+  if (klen < 0 || plen < 0) {
+    fprintf(stderr, "frost_stubs: refresh_shares hex decode failed\n");
+    return -1;
+  }
+  *new_key_pkg_len_out = (uint16_t)klen;
+  *new_pub_key_pkg_len_out = (uint16_t)plen;
+  return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════
  * frost_commit
  * ═══════════════════════════════════════════════════════════════ */
