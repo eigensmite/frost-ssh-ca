@@ -20,6 +20,7 @@ name = "frost_signer_core"
 path = "main.rs"
 
 [dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
 frost-ed25519 = { version = "3.0.0", features = ["serialization"] }
 ssh-key = { version = "0.6", features = ["alloc", "std", "ed25519", "std", "crypto"] }
 signature = "2"

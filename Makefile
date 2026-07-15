@@ -1,72 +1,141 @@
+# Makefile — FROST distributed SSH CA
 #
-# Makefile for FROST DKG coordinator/signer transport layer
-# Mirrors the style of the base project Makefile.
-#
-CC          = gcc
-EXECUTABLES = frost_coordinator frost_signer
-INCLUDES    = $(wildcard *.h)
-SOURCES     = $(wildcard *.c)
-DEPS        = $(INCLUDES)
-OBJECTS     = $(SOURCES:.c=.o)
-OBJECTS    += $(SOURCES:.c=.dSYM*)
-EXTRAS      = $(SOURCES:.c=.exe*)
+# Targets:
+#   all          build coordinator and both signers
+#   dkg          run a 2-of-2 DKG session (generates key shares)
+#   sign         run a signing session (issues user_key-cert.pub)
+#   verify       inspect the issued certificate with ssh-keygen -L
+#   clean        remove binaries and generated artefacts
+#   clean-shares remove persisted key shares (forces new DKG)
+#   help         print usage summary
 
-CFLAGS  = -g -ggdb3 -std=c99 \
-          -Wuninitialized -Wunused -Wunused-macros -Wunused-variable \
-          -Wunused-function \
-          -Wignored-qualifiers -Wshift-negative-value \
-          -Wmain -Wreturn-type \
-          -Winit-self -Wimplicit-int -Wimplicit-fallthrough \
-          -Wparentheses -Wdangling-else \
-          -Wreturn-type -Wredundant-decls -Wswitch-default -Wshadow \
-          -Wformat=2 -Wformat-nonliteral -Wformat-y2k -Wformat-security \
-          -Wextra -Wpedantic
+CC      = gcc
+CFLAGS  = -g -std=c99 -Wall -Wextra -Wpedantic \
+           -Wno-unused-function -Wno-unused-variable \
+           -Wno-missing-field-initializers
+LDFLAGS = -lgnutls
 
-LIBS    = -lgnutls
+# Path to the compiled Rust FROST core binary.
+# Override:  make all FROST_CORE=./target/release/frost_signer_core
+FROST_CORE ?= ./frost_signer_core/target/debug/frost_signer_core
 
-LDFLAGS =
+FROST_DEF = -DFROST_CORE_BIN=\"$(FROST_CORE)\"
 
-all: $(EXECUTABLES)
+# Default parameters (override on command line)
+N        ?= 2
+T        ?= 2
+USER_KEY ?= user_key.pub
+PRINCIPAL?= user
+SERIAL   ?= 1
+VALIDITY ?= 86400
+OUTPUT   ?= user_key-cert.pub
 
-frost_coordinator: frost_coordinator.c $(DEPS)
-	$(CC) $(LDFLAGS) $(CFLAGS) -o $@ $< $(LIBS)
+.PHONY: all dkg dkg-coord dkg-signer1 dkg-signer2 \
+        sign sign-coord sign-signer1 sign-signer2 \
+        verify clean clean-shares help
 
-frost_signer: frost_signer.c $(DEPS)
-	$(CC) $(LDFLAGS) $(CFLAGS) -o $@ $< $(LIBS)
+all: frost_coordinator frost_signer_1 frost_signer_2
 
-# Generate self-signed test certificates (reuses the rootCA from base project)
-# Run this once before testing if you don't already have certs/
-certs:
-	mkdir -p certs
-	openssl genrsa -out certs/rootCA.key 4096
-	openssl req -x509 -new -nodes -key certs/rootCA.key \
-	    -sha256 -days 1024 -out certs/rootCA.crt \
-	    -subj "/C=US/CN=FROST Test CA"
-	# coordinator cert
-	openssl genrsa -out certs/directorykey.pem 2048
-	openssl req -new -key certs/directorykey.pem \
-	    -out certs/directory.csr \
-	    -subj "/C=US/CN=Directory Server"
-	openssl x509 -req -in certs/directory.csr \
-	    -CA certs/rootCA.crt -CAkey certs/rootCA.key \
-	    -CAcreateserial -out certs/directory.crt -days 500 -sha256
-	# signer 1 cert
-	openssl genrsa -out certs/beocatkey.pem 2048
-	openssl req -new -key certs/beocatkey.pem \
-	    -out certs/beocat.csr \
-	    -subj "/C=US/CN=BeoCat"
-	openssl x509 -req -in certs/beocat.csr \
-	    -CA certs/rootCA.crt -CAkey certs/rootCA.key \
-	    -CAcreateserial -out certs/beocat.crt -days 500 -sha256
-	# signer 2 cert
-	openssl genrsa -out certs/footballkey.pem 2048
-	openssl req -new -key certs/footballkey.pem \
-	    -out certs/football.csr \
-	    -subj "/C=US/CN=KSU Football"
-	openssl x509 -req -in certs/football.csr \
-	    -CA certs/rootCA.crt -CAkey certs/rootCA.key \
-	    -CAcreateserial -out certs/football.crt -days 500 -sha256
+# ── Binaries ─────────────────────────────────────────────────────
 
-.PHONY: clean certs
+frost_coordinator: frost_coordinator.c frost_common.h frost_stubs.c
+	$(CC) $(CFLAGS) $(FROST_DEF) -o $@ frost_coordinator.c $(LDFLAGS)
+
+frost_signer_1: frost_signer.c frost_common.h frost_stubs.c
+	$(CC) $(CFLAGS) $(FROST_DEF) -o $@ frost_signer.c $(LDFLAGS)
+
+frost_signer_2: frost_signer.c frost_common.h frost_stubs.c
+	$(CC) $(CFLAGS) $(FROST_DEF) -o $@ frost_signer.c $(LDFLAGS)
+
+# ── DKG mode ─────────────────────────────────────────────────────
+# Run each in a separate terminal, coordinator first.
+
+dkg-coord:
+	mkdir -p shares
+	./frost_coordinator dkg --n $(N) --t $(T)
+
+dkg-signer1: frost_signer_1
+	./frost_signer_1 certs/beocat.crt certs/beocatkey.pem $(N) $(T)
+
+dkg-signer2: frost_signer_2
+	./frost_signer_2 certs/football.crt certs/footballkey.pem $(N) $(T)
+
+# Convenience: all three in background (requires job control)
+dkg: all
+	@echo "Starting DKG session (n=$(N), t=$(T))..."
+	@mkdir -p shares
+	@./frost_coordinator dkg --n $(N) --t $(T) &
+	@sleep 0.4
+	@./frost_signer_1 certs/beocat.crt   certs/beocatkey.pem   $(N) $(T) &
+	@./frost_signer_2 certs/football.crt certs/footballkey.pem $(N) $(T) &
+	@wait
+	@echo "DKG complete -- key shares in ./shares/"
+
+# ── SIGN mode ────────────────────────────────────────────────────
+# Run each in a separate terminal, coordinator first.
+
+sign-coord:
+	./frost_coordinator sign \
+	    --user-key  $(USER_KEY) \
+	    --principal $(PRINCIPAL) \
+	    --n         $(N) \
+	    --t         $(T) \
+	    --serial    $(SERIAL) \
+	    --validity  $(VALIDITY) \
+	    --output    $(OUTPUT)
+
+sign-signer1: frost_signer_1
+	./frost_signer_1 certs/beocat.crt certs/beocatkey.pem $(N) $(T)
+
+sign-signer2: frost_signer_2
+	./frost_signer_2 certs/football.crt certs/footballkey.pem $(N) $(T)
+
+# Convenience: all three in background
+sign: all
+	@echo "Starting signing session..."
+	@echo "  user key:  $(USER_KEY)"
+	@echo "  principal: $(PRINCIPAL)"
+	@echo "  output:    $(OUTPUT)"
+	@./frost_coordinator sign \
+	    --user-key $(USER_KEY) --principal $(PRINCIPAL) \
+	    --n $(N) --t $(T) --serial $(SERIAL) \
+	    --validity $(VALIDITY) --output $(OUTPUT) &
+	@sleep 0.4
+	@./frost_signer_1 certs/beocat.crt   certs/beocatkey.pem   $(N) $(T) &
+	@./frost_signer_2 certs/football.crt certs/footballkey.pem $(N) $(T) &
+	@wait
+	@echo "Done -- certificate at $(OUTPUT)"
+
+# ── Verification ─────────────────────────────────────────────────
+verify:
+	ssh-keygen -L -f $(OUTPUT)
+
+# ── Cleanup ──────────────────────────────────────────────────────
 clean:
-	@-rm -rf $(OBJECTS) $(EXECUTABLES) $(EXTRAS)
+	rm -f frost_coordinator frost_signer_1 frost_signer_2
+	rm -f pub_key_pkg.hex frost_ca_signer_*.pub signature_pkg.hex
+	rm -f $(OUTPUT)
+
+clean-shares:
+	rm -rf shares/
+
+help:
+	@echo ""
+	@echo "FROST distributed SSH CA -- build and run targets"
+	@echo ""
+	@echo "  make all                           build coordinator + signers"
+	@echo "  make dkg  [N=n T=t]                run full DKG session"
+	@echo "  make sign [USER_KEY=f PRINCIPAL=p] issue an SSH certificate"
+	@echo "  make verify [OUTPUT=f]             inspect issued certificate"
+	@echo "  make clean                         remove binaries + outputs"
+	@echo "  make clean-shares                  remove persisted key shares"
+	@echo ""
+	@echo "Manual mode (separate terminals):"
+	@echo "  Term 1:  make dkg-coord"
+	@echo "  Term 2:  make dkg-signer1"
+	@echo "  Term 3:  make dkg-signer2"
+	@echo ""
+	@echo "  Term 1:  make sign-coord USER_KEY=user_key.pub PRINCIPAL=alice"
+	@echo "  Term 2:  make sign-signer1"
+	@echo "  Term 3:  make sign-signer2"
+	@echo ""

@@ -1,30 +1,41 @@
-/* frost_coordinator.c — FROST DKG coordinator / relay server.
+/* frost_coordinator.c — FROST DKG coordinator with ROAST session management.
  *
- * Mirrors directoryServer5.c in structure:
- *   - single-process, select()-based event loop
- *   - GnuTLS for all connections (same LOOP_CHECK / GNUTLS_E_AGAIN pattern)
- *   - BSD sys/queue linked lists for signer tracking
- *   - staged_connection → signer promotion on HELLO handshake
+ * Two operating modes selected by the first command-line argument:
  *
- * Protocol roles:
- *   1. Each signer connects, sends FROST_MSG_HELLO with its parameters.
- *   2. Once n signers are registered, coordinator broadcasts START_DKG.
- *   3. Coordinator relays all DKG round-1 packages (broadcast).
- *   4. Coordinator relays DKG round-2 packages (unicast by target ID).
- *   5. On SIGN_REQ (from stdin or external trigger), coordinator
- *      collects commitments then assembles and relays the signing package.
- *   6. Coordinator collects signature shares and calls the Rust FROST
- *      signer binary (via popen) to aggregate — or simply relays shares
- *      to a designated aggregator signer.
+ *   DKG mode  — negotiate a shared key across n signers.
+ *     ./frost_coordinator dkg [--n <n>] [--t <t>]
+ *     n/t may be inferred from the first signer's HELLO.
+ *     Outputs: pub_key_pkg.hex  frost_ca_signer_1.pub
  *
- * Compile:
- *   gcc -g -std=c99 -Wall -Wextra -o frost_coordinator frost_coordinator.c \
- *       -lgnutls
+ *   SIGN mode  — issue an SSH user certificate using existing key shares.
+ *     ./frost_coordinator sign \
+ *         --user-key  <pubkey-file>   user's SSH public key to certify
+ *         --principal <name>          SSH principal  (e.g. "alice")
+ *         [--n <n>]                   total signers  (default from HELLOs)
+ *         [--t <t>]                   threshold      (default from HELLOs)
+ *         [--serial   <n>]            cert serial number  (default 1)
+ *         [--validity <secs>]         seconds from now    (default 86400)
+ *         [--output   <file>]         output path  (default user_key-cert.pub)
+ *
+ * Certificate assembly delegates entirely to the Rust binary:
+ *   Step 1 (startup): frost_signer_core tbs  → raw TBS bytes + dummy cert
+ *   Step 2 (post-agg): frost_signer_core mint → real cert with FROST sig
+ * The coordinator never touches SSH wire format directly.
+ *
+ * ROAST session management (sign mode):
+ *   Coordinator gathers nonce commitments from all n signers simultaneously.
+ *   As soon as t non-blacklisted responsive signers have committed, a signing
+ *   session is formed.  If the aggregate fails, all signers in that session
+ *   are blacklisted (simplified identifiable abort) and a fresh SIGN_REQ is
+ *   broadcast to the remaining signers.  The first session to successfully
+ *   aggregate wins; its signature is fed to `mint` to produce the certificate.
+ *
+ * Compile: gcc -g -std=c99 -Wall -Wextra -o frost_coordinator \
+ *              frost_coordinator.c -lgnutls
  */
 
 #define _GNU_SOURCE
 #include <arpa/inet.h>
-#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -36,46 +47,49 @@
 #include <sys/queue.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <gnutls/gnutls.h>
 #include <gnutls/x509.h>
 
 #include "frost_common.h"
-#include "frost_stubs.c"
+#include "frost_stubs.c" /* bytes_to_hex, hex_to_bytes, popen_multi, … */
 
-/* ── Per-signer state ─────────────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════
+ * Per-connection data structures
+ * ══════════════════════════════════════════════════════════════════ */
+
 struct signer {
   gnutls_session_t session;
   int sockfd;
   struct sockaddr_in addr;
 
-  uint16_t id; /* assigned 1..n                   */
-  uint16_t n;  /* total signers declared at HELLO  */
-  uint16_t t;  /* threshold declared at HELLO      */
+  uint16_t id, n, t;
 
-  /* Inbound reassembly — we accumulate FROST_FRAME_MAX bytes then parse */
   uint8_t inbuf[FROST_FRAME_MAX];
-  uint8_t *inptr; /* next write position in inbuf     */
-
-  /* Outbound queue */
+  uint8_t *inptr;
   TAILQ_HEAD(, outmsg) msgq;
   int want_write;
 
-  /* Per-signer DKG material (opaque postcard blobs) */
-  uint8_t r1_pkg[FROST_MAX_PAYLOAD]; /* round-1 pkg bytes */
+  /* DKG relay buffers */
+  uint8_t r1_pkg[FROST_MAX_PAYLOAD];
   uint16_t r1_len;
-  int r2_complete;                   /* 1 when signer sent R2_COMPLETE  */
-  uint8_t commit[FROST_MAX_PAYLOAD]; /* signing commitment */
+  int r2_complete;
+
+  /* Sign-mode per-signer state */
+  uint8_t commit[FROST_MAX_PAYLOAD];
   uint16_t commit_len;
   uint8_t sig_share[FROST_MAX_PAYLOAD];
   uint16_t sig_share_len;
+  sphase_t sign_phase;
+  uint32_t session_id; /* which ROAST session this signer is in */
 
   LIST_ENTRY(signer) entries;
 };
 
-/* ── Staged connection (TLS done, identity not yet known) ──────── */
 struct staged_conn {
   gnutls_session_t session;
   int sockfd;
@@ -90,400 +104,267 @@ struct staged_conn {
 LIST_HEAD(signerlist, signer);
 LIST_HEAD(stagedlist, staged_conn);
 
-/* ── Global DKG session state ─────────────────────────────────── */
+/* ══════════════════════════════════════════════════════════════════
+ * Global state
+ * ══════════════════════════════════════════════════════════════════ */
+
+static coord_mode_t g_mode = COORD_MODE_DKG;
 static dkg_state_t g_dkg_state = DKG_IDLE;
-static uint16_t g_n = 0;                 /* agreed total signers              */
-static uint16_t g_t = 0;                 /* agreed threshold                  */
-static uint16_t g_next_id = 1;           /* next signer ID to assign          */
-static uint8_t g_tbs[FROST_MAX_PAYLOAD]; /* To Be Signed buffer               */
-static uint16_t g_tbs_len = 0;           /* tbs length                        */
-static uint8_t g_signing_pkg[FROST_MAX_PAYLOAD];
-static uint16_t g_signing_pkg_len = 0;
+static uint16_t g_n = 0;
+static uint16_t g_t = 0;
+static uint16_t g_next_id = 1;
+
+/* PublicKeyPackage — needed by coordinator for aggregate calls */
 static uint8_t g_pub_key_pkg[FROST_MAX_PAYLOAD];
 static uint16_t g_pub_key_pkg_len = 0;
 
-/* ── Forward declarations ─────────────────────────────────────── */
-static void signer_queue_frame(struct signer *sg, frost_msg_t type,
-                               const uint8_t *payload, uint16_t plen);
-static void staged_queue_frame(struct staged_conn *st, frost_msg_t type,
-                               const uint8_t *payload, uint16_t plen);
-static void remove_signer(struct signerlist *list, struct signer *sg);
-static void remove_staged(struct stagedlist *list, struct staged_conn *st);
-static void drain_signer_write(struct signer *sg, struct signerlist *list);
-static void drain_staged_write(struct staged_conn *st, struct stagedlist *list);
-static void process_signer_frame(struct signerlist *list, struct signer *sg,
-                                 frost_msg_t type, const uint8_t *payload,
-                                 uint16_t plen);
-static void maybe_start_dkg(struct signerlist *list);
-static void relay_r1_to_all(struct signerlist *list, struct signer *sender);
-static void relay_r2_to_target(struct signerlist *list, uint16_t target_id,
-                               const uint8_t *payload, uint16_t plen);
-static void maybe_broadcast_signing_pkg(struct signerlist *list,
-                                        const uint8_t *tbs, uint16_t tbs_len);
-static void maybe_aggregate(struct signerlist *list);
+/* TBS (to-be-signed) bytes — generated by `frost_signer_core tbs` */
+static uint8_t g_tbs[FROST_MAX_PAYLOAD];
+static uint16_t g_tbs_len = 0;
+/* Hex encoding of g_tbs — passed to `mint` as stdin line 3 */
+static char g_tbs_hex[FROST_MAX_PAYLOAD * 2 + 4];
+/* Dummy cert template — output of `tbs`, passed to `mint` as stdin line 1 */
+static char g_dummy_cert[FROST_MAX_PAYLOAD];
 
-/* ═══════════════════════════════════════════════════════════════ */
-int main(void) {
-  /* ── Init GnuTLS ──────────────────────────────────────────── */
-  gnutls_certificate_credentials_t x509_cred;
-  gnutls_global_init();
-  gnutls_certificate_allocate_credentials(&x509_cred);
-  gnutls_certificate_set_x509_trust_file(x509_cred, FROST_CAFILE,
-                                         GNUTLS_X509_FMT_PEM);
-  if (gnutls_certificate_set_x509_key_file(x509_cred, FROST_COORD_CERT,
-                                           FROST_COORD_KEY,
-                                           GNUTLS_X509_FMT_PEM) < 0) {
-    fprintf(stderr, "coordinator: failed to load cert/key\n");
-    return EXIT_FAILURE;
-  }
+/* ROAST state */
+static struct roast_session g_sessions[ROAST_MAX_SESSIONS];
+static uint32_t g_next_session_id = 1;
+static int g_signing_done = 0;
 
-  /* ── Create listening socket ──────────────────────────────── */
-  int listenfd;
-  struct sockaddr_in serv_addr;
+/* Identifiable-abort blacklist */
+static uint16_t g_blacklist[FROST_MAX_SIGNERS];
+static int g_n_blacklisted = 0;
 
-  if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-    perror("coordinator: socket");
-    return EXIT_FAILURE;
-  }
-  int yes = 1;
-  setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+/* Sign-mode cert parameters */
+static char g_user_key_file[256] = "user_key.pub";
+static char g_principal[128] = "";
+static char g_output_file[256] = "user_key-cert.pub";
+static uint64_t g_serial = 1;
+static uint64_t g_validity_secs = 86400;
 
-  memset(&serv_addr, 0, sizeof(serv_addr));
-  serv_addr.sin_family = AF_INET;
-  serv_addr.sin_addr.s_addr = inet_addr(FROST_COORD_HOST);
-  serv_addr.sin_port = htons(FROST_COORD_PORT);
+/* Num signers finished refresh */
+static int g_refresh_complete_count = 0;
 
-  if (bind(listenfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-    perror("coordinator: bind");
-    close(listenfd);
-    return EXIT_FAILURE;
-  }
-  listen(listenfd, FROST_MAX_SIGNERS + 4);
-  printf("coordinator: listening on %s:%d\n", FROST_COORD_HOST,
-         FROST_COORD_PORT);
+/* ── Per-signer reliability tracking ─────────────────────────── */
+#define FROST_MAX_STRIKES 2 /* blacklist after this many silent sessions */
+static int g_strikes[FROST_MAX_SIGNERS]; /* indexed by signer_id - 1        */
 
-  /* ── Peer lists ───────────────────────────────────────────── */
-  struct signerlist signers;
-  struct stagedlist staged;
-  LIST_INIT(&signers);
-  LIST_INIT(&staged);
-
-  /* ── Event loop ───────────────────────────────────────────── */
-  for (;;) {
-    fd_set readset, writeset;
-    int max_fd;
-    FD_ZERO(&readset);
-    FD_ZERO(&writeset);
-
-    /* listening socket always readable */
-    FD_SET(listenfd, &readset);
-    max_fd = listenfd;
-
-    /* stdin for manual SIGN_REQ trigger during testing */
-    FD_SET(STDIN_FILENO, &readset);
-
-    /* signers */
-    struct signer *sg, *tmp_sg;
-    LIST_FOREACH_SAFE(sg, &signers, entries, tmp_sg) {
-      if (sg->sockfd < 0)
-        continue;
-      if (sg->want_write || !TAILQ_EMPTY(&sg->msgq))
-        FD_SET(sg->sockfd, &writeset);
-      else
-        FD_SET(sg->sockfd, &readset);
-      if (sg->sockfd > max_fd)
-        max_fd = sg->sockfd;
-    }
-
-    /* staged connections */
-    struct staged_conn *st, *tmp_st;
-    LIST_FOREACH_SAFE(st, &staged, entries, tmp_st) {
-      if (st->sockfd < 0)
-        continue;
-      if (st->want_write || !TAILQ_EMPTY(&st->msgq))
-        FD_SET(st->sockfd, &writeset);
-      else
-        FD_SET(st->sockfd, &readset);
-      if (st->sockfd > max_fd)
-        max_fd = st->sockfd;
-    }
-
-    struct timeval tv = {.tv_sec = 0, .tv_usec = 500000};
-    int sel = select(max_fd + 1, &readset, &writeset, NULL, &tv);
-    if (sel < 0) {
-      if (errno == EINTR)
-        continue;
-      perror("coordinator: select");
-      break;
-    }
-    if (sel == 0)
-      continue;
-
-    /* ── stdin: manual signing trigger ───────────────────── */
-    if (FD_ISSET(STDIN_FILENO, &readset)) {
-      char line[FROST_FRAME_MAX];
-      if (fgets(line, sizeof(line), stdin)) {
-        /* strip newline */
-        line[strcspn(line, "\n")] = '\0';
-        if (strncmp(line, "SIGN ", 5) == 0) {
-          /* rest of line is hex TBS bytes */
-          const char *hex = line + 5;
-          size_t hexlen = strlen(hex);
-          uint16_t tbslen = (uint16_t)(hexlen / 2);
-          uint8_t tbs[FROST_MAX_PAYLOAD];
-          for (uint16_t i = 0; i < tbslen && i < FROST_MAX_PAYLOAD; i++) {
-            unsigned int byte;
-            if (sscanf(hex + 2 * i, "%02x", &byte) == 1)
-              tbs[i] = (uint8_t)byte;
-          }
-          maybe_broadcast_signing_pkg(&signers, tbs, tbslen);
-        } else {
-          fprintf(stderr, "coordinator: unknown command '%s'\n", line);
-          fprintf(stderr, "  use: SIGN <hex-encoded TBS bytes>\n");
-        }
-      }
-    }
-
-    /* ── Accept new TCP connection ────────────────────────── */
-    if (FD_ISSET(listenfd, &readset)) {
-      struct sockaddr_in cli_addr;
-      socklen_t clilen = sizeof(cli_addr);
-      int newsock = accept(listenfd, (struct sockaddr *)&cli_addr, &clilen);
-      if (newsock < 0) {
-        perror("coordinator: accept");
-      } else {
-        /* non-blocking */
-        if (fcntl(newsock, F_SETFL, O_NONBLOCK) < 0) {
-          perror("fcntl O_NONBLOCK");
-          close(newsock);
-          goto accept_done;
-        }
-
-        /* TLS handshake */
-        gnutls_session_t sess;
-        gnutls_init(&sess, GNUTLS_SERVER);
-        gnutls_credentials_set(sess, GNUTLS_CRD_CERTIFICATE, x509_cred);
-        gnutls_certificate_server_set_request(sess, GNUTLS_CERT_IGNORE);
-        gnutls_handshake_set_timeout(sess, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
-        gnutls_priority_set_direct(sess, "NORMAL", NULL);
-        gnutls_transport_set_int(sess, newsock);
-
-        int ret = gnutls_handshake(sess);
-        if (ret == GNUTLS_E_AGAIN || ret == GNUTLS_E_INTERRUPTED) {
-          fprintf(stderr, "coordinator: handshake interrupted, dropping\n");
-          gnutls_deinit(sess);
-          close(newsock);
-          goto accept_done;
-        }
-        if (ret < 0) {
-          fprintf(stderr, "coordinator: handshake failed: %s\n",
-                  gnutls_strerror(ret));
-          gnutls_deinit(sess);
-          close(newsock);
-          goto accept_done;
-        }
-        printf("coordinator: TLS handshake done with %s\n",
-               inet_ntoa(cli_addr.sin_addr));
-
-        struct staged_conn *new_st = malloc(sizeof(*new_st));
-        if (!new_st) {
-          gnutls_deinit(sess);
-          close(newsock);
-          goto accept_done;
-        }
-        new_st->session = sess;
-        new_st->sockfd = newsock;
-        new_st->addr = cli_addr;
-        new_st->inptr = new_st->inbuf;
-        new_st->want_write = 0;
-        TAILQ_INIT(&new_st->msgq);
-        LIST_INSERT_HEAD(&staged, new_st, entries);
-        printf("coordinator: staged connection %d from %s\n", newsock,
-               inet_ntoa(cli_addr.sin_addr));
-      }
-    }
-  accept_done:;
-
-    /* ── Service staged connections ───────────────────────── */
-    LIST_FOREACH_SAFE(st, &staged, entries, tmp_st) {
-
-      if (FD_ISSET(st->sockfd, &writeset)) {
-        drain_staged_write(st, &staged);
-        /* st may be freed; next iteration is safe via FOREACH_SAFE */
-        continue;
-      }
-
-      if (!FD_ISSET(st->sockfd, &readset))
-        continue;
-
-      /* read into inbuf */
-      int ret = gnutls_record_recv(st->session, st->inptr,
-                                   (st->inbuf + FROST_FRAME_MAX) - st->inptr);
-      if (ret == GNUTLS_E_AGAIN || ret == GNUTLS_E_INTERRUPTED) {
-        st->want_write = gnutls_record_get_direction(st->session);
-        continue;
-      }
-      if (ret <= 0) {
-        fprintf(stderr, "coordinator: staged %d disconnected\n", st->sockfd);
-        remove_staged(&staged, st);
-        continue;
-      }
-      st->inptr += ret;
-
-      /* need full header first */
-      if ((st->inptr - st->inbuf) < FROST_FRAME_HDR)
-        continue;
-
-      frost_msg_t msg_type;
-      uint16_t plen = frost_decode_header(st->inbuf, &msg_type);
-
-      /* wait until we have the full frame */
-      if ((st->inptr - st->inbuf) < (int)(FROST_FRAME_HDR + plen))
-        continue;
-
-      /* reset for next frame */
-      st->inptr = st->inbuf;
-
-      if (msg_type != FROST_MSG_HELLO) {
-        fprintf(stderr, "coordinator: unexpected msg 0x%02x from staged %d\n",
-                (unsigned)msg_type, st->sockfd);
-        remove_staged(&staged, st);
-        continue;
-      }
-
-      /* parse HELLO payload: "SIGNER <n> <t>\n" */
-      char hellobuf[64];
-      uint16_t pn = 0, pt = 0;
-      size_t copy_len = plen < 63 ? plen : 63;
-      memcpy(hellobuf, st->inbuf + FROST_FRAME_HDR, copy_len);
-      hellobuf[copy_len] = '\0';
-
-      if (sscanf(hellobuf, "SIGNER %hu %hu", &pn, &pt) != 2 || pn < 2 ||
-          pt < 1 || pt > pn || pn > FROST_MAX_SIGNERS) {
-        fprintf(stderr, "coordinator: bad HELLO from staged %d: '%s'\n",
-                st->sockfd, hellobuf);
-        const uint8_t *errmsg = (const uint8_t *)"bad HELLO parameters";
-        staged_queue_frame(st, FROST_MSG_ERROR, errmsg,
-                           (uint16_t)strlen((char *)errmsg));
-        continue;
-      }
-
-      /* check consistency if n/t already fixed by a prior signer */
-      if (g_n == 0) {
-        g_n = pn;
-        g_t = pt;
-      } else if (pn != g_n || pt != g_t) {
-        fprintf(stderr, "coordinator: n/t mismatch from staged %d\n",
-                st->sockfd);
-        const uint8_t *errmsg = (const uint8_t *)"n/t mismatch";
-        staged_queue_frame(st, FROST_MSG_ERROR, errmsg,
-                           (uint16_t)strlen((char *)errmsg));
-        continue;
-      }
-
-      /* promote to signer */
-      struct signer *new_sg = malloc(sizeof(*new_sg));
-      if (!new_sg) {
-        remove_staged(&staged, st);
-        continue;
-      }
-
-      new_sg->session = st->session;
-      new_sg->sockfd = st->sockfd;
-      new_sg->addr = st->addr;
-      new_sg->id = g_next_id++;
-      new_sg->n = g_n;
-      new_sg->t = g_t;
-      new_sg->inptr = new_sg->inbuf;
-      new_sg->want_write = 0;
-      new_sg->r1_len = 0;
-      new_sg->commit_len = 0;
-      new_sg->sig_share_len = 0;
-      TAILQ_INIT(&new_sg->msgq);
-
-      /* free staged shell (don't close its socket — transferred to new_sg) */
-      {
-        struct outmsg *_dm, *_dtm;
-        TAILQ_FOREACH_SAFE(_dm, &st->msgq, entries, _dtm) {
-          TAILQ_REMOVE(&st->msgq, _dm, entries);
-          free(_dm->data);
-          free(_dm);
-        }
-      }
-      LIST_REMOVE(st, entries);
-      free(st);
-
-      LIST_INSERT_HEAD(&signers, new_sg, entries);
-      printf("coordinator: signer %u registered (n=%u t=%u) from %s\n",
-             new_sg->id, new_sg->n, new_sg->t,
-             inet_ntoa(new_sg->addr.sin_addr));
-
-      /* ACK with assigned ID */
-      char ackbuf[32];
-      int acklen = snprintf(ackbuf, sizeof(ackbuf), "ACK %u\n", new_sg->id);
-      signer_queue_frame(new_sg, FROST_MSG_HELLO_ACK, (uint8_t *)ackbuf,
-                         (uint16_t)acklen);
-
-      maybe_start_dkg(&signers);
-    } /* staged foreach */
-
-    /* ── Service registered signers ───────────────────────── */
-    LIST_FOREACH_SAFE(sg, &signers, entries, tmp_sg) {
-
-      if (FD_ISSET(sg->sockfd, &writeset)) {
-        drain_signer_write(sg, &signers);
-        continue;
-      }
-
-      if (!FD_ISSET(sg->sockfd, &readset))
-        continue;
-
-      /* read into inbuf */
-      int ret = gnutls_record_recv(sg->session, sg->inptr,
-                                   (sg->inbuf + FROST_FRAME_MAX) - sg->inptr);
-      if (ret == GNUTLS_E_AGAIN || ret == GNUTLS_E_INTERRUPTED) {
-        sg->want_write = gnutls_record_get_direction(sg->session);
-        continue;
-      }
-      if (ret <= 0) {
-        if (ret < 0)
-          fprintf(stderr, "coordinator: read error from signer %u: %s\n",
-                  sg->id, gnutls_strerror(ret));
-        else
-          printf("coordinator: signer %u disconnected\n", sg->id);
-        remove_signer(&signers, sg);
-        continue;
-      }
-      sg->inptr += ret;
-
-      if ((sg->inptr - sg->inbuf) < FROST_FRAME_HDR)
-        continue;
-
-      frost_msg_t msg_type;
-      uint16_t plen = frost_decode_header(sg->inbuf, &msg_type);
-
-      if ((sg->inptr - sg->inbuf) < (int)(FROST_FRAME_HDR + plen))
-        continue;
-
-      sg->inptr = sg->inbuf; /* reset for next frame */
-
-      process_signer_frame(&signers, sg, msg_type, sg->inbuf + FROST_FRAME_HDR,
-                           plen);
-    } /* signer foreach */
-
-  } /* for(;;) */
-
-  gnutls_global_deinit();
-  close(listenfd);
-  return EXIT_SUCCESS;
+static int get_strikes(uint16_t id) {
+  int idx = (int)id - 1;
+  return (idx >= 0 && idx < FROST_MAX_SIGNERS) ? g_strikes[idx] : 0;
 }
 
-/* ═══════════════════════════════════════════════════════════════
- * Static helpers
- * ═══════════════════════════════════════════════════════════════ */
+static void add_strike(uint16_t id) {
+  int idx = (int)id - 1;
+  if (idx >= 0 && idx < FROST_MAX_SIGNERS)
+    g_strikes[idx]++;
+}
 
-static void signer_queue_frame(struct signer *sg, frost_msg_t type,
-                               const uint8_t *payload, uint16_t plen) {
+/* ══════════════════════════════════════════════════════════════════
+ * Rust binary integration — tbs and mint
+ * ══════════════════════════════════════════════════════════════════ */
+
+/*  Call frost_signer_core tbs to get the to-be-signed bytes and the
+ *  dummy certificate template.
+ *
+ *  stdin to Rust binary:
+ *    line 1  path to user public-key file (read by Rust directly)
+ *    line 2  serial (decimal u64)
+ *    line 3  principal string
+ *    line 4  valid_after  (unix seconds)
+ *    line 5  valid_before (unix seconds)
+ *
+ *  stdout from Rust binary:
+ *    line 1  hex(TBS bytes) — sent to signers via SIGN_REQ
+ *    line 2  OpenSSH cert string with dummy signature — saved for mint
+ *
+ *  On success: populates g_tbs, g_tbs_len, g_tbs_hex, g_dummy_cert.
+ *  Returns 0 on success, -1 on failure.
+ */
+static int call_tbs(uint64_t valid_after, uint64_t valid_before) {
+  /* Build stdin content */
+  char stdin_buf[512];
+  int n = snprintf(stdin_buf, sizeof(stdin_buf), "%s\n%llu\n%s\n%llu\n%llu\n",
+                   g_user_key_file, (unsigned long long)g_serial, g_principal,
+                   (unsigned long long)valid_after,
+                   (unsigned long long)valid_before);
+  if (n <= 0 || n >= (int)sizeof(stdin_buf)) {
+    fprintf(stderr, "coordinator: tbs stdin buffer overflow\n");
+    return -1;
+  }
+
+  char tmpfile[] = "/tmp/frost_tbs_XXXXXX";
+  int tmpfd = mkstemp(tmpfile);
+  if (tmpfd < 0) {
+    perror("mkstemp tbs");
+    return -1;
+  }
+  if (write(tmpfd, stdin_buf, (size_t)n) < 0) {
+    perror("write tbs");
+    close(tmpfd);
+    unlink(tmpfile);
+    return -1;
+  }
+  close(tmpfd);
+
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " tbs < %s", tmpfile);
+  FILE *fp = popen(cmd, "r");
+  if (!fp) {
+    perror("popen tbs");
+    unlink(tmpfile);
+    return -1;
+  }
+
+  /* line 1: hex(TBS bytes) */
+  char tbs_hex_line[FROST_MAX_PAYLOAD * 2 + 4];
+  if (!fgets(tbs_hex_line, sizeof(tbs_hex_line), fp)) {
+    fprintf(stderr, "coordinator: tbs produced no output\n");
+    pclose(fp);
+    unlink(tmpfile);
+    return -1;
+  }
+  tbs_hex_line[strcspn(tbs_hex_line, "\r\n")] = '\0';
+
+  /* line 2: OpenSSH cert string (may be long; fits in FROST_MAX_PAYLOAD) */
+  if (!fgets(g_dummy_cert, sizeof(g_dummy_cert), fp)) {
+    fprintf(stderr, "coordinator: tbs missing dummy cert line\n");
+    pclose(fp);
+    unlink(tmpfile);
+    return -1;
+  }
+  g_dummy_cert[strcspn(g_dummy_cert, "\r\n")] = '\0';
+
+  int exit_code = pclose(fp);
+  unlink(tmpfile);
+
+  if (exit_code != 0) {
+    fprintf(stderr, "coordinator: tbs command failed (exit %d)\n", exit_code);
+    return -1;
+  }
+  if (tbs_hex_line[0] == '\0') {
+    fprintf(stderr, "coordinator: tbs returned empty TBS\n");
+    return -1;
+  }
+
+  /* Decode TBS hex → raw bytes for SIGN_REQ payload */
+  int tlen = hex_to_bytes(tbs_hex_line, g_tbs, FROST_MAX_PAYLOAD);
+  if (tlen <= 0) {
+    fprintf(stderr, "coordinator: tbs hex decode failed\n");
+    return -1;
+  }
+  g_tbs_len = (uint16_t)tlen;
+
+  /* Keep hex string for mint call */
+  strncpy(g_tbs_hex, tbs_hex_line, sizeof(g_tbs_hex) - 1);
+  g_tbs_hex[sizeof(g_tbs_hex) - 1] = '\0';
+
+  printf("coordinator: TBS generated (%u bytes)\n", g_tbs_len);
+  printf("coordinator: dummy cert template captured\n");
+  return 0;
+}
+
+/*  Call frost_signer_core mint to inject the FROST aggregate signature
+ *  into the dummy certificate template, producing a valid OpenSSH cert.
+ *
+ *  stdin to Rust binary:
+ *    line 1  OpenSSH cert string with dummy sig (from call_tbs)
+ *    line 2  hex(64-byte FROST aggregate signature)
+ *    line 3  hex(TBS bytes, same as signed) — Rust reads but doesn't use
+ *
+ *  stdout from Rust binary:
+ *    line 1  final OpenSSH certificate string
+ *
+ *  The certificate is written to g_output_file.
+ *  Returns 0 on success, -1 on failure.
+ */
+static int call_mint(const uint8_t *sig64) {
+  char sig_hex[64 * 2 + 4];
+  bytes_to_hex(sig64, 64, sig_hex);
+
+  /* Build stdin: dummy_cert \n sig_hex \n tbs_hex */
+  /* Largest possible input: ~900 + 128 + 8192 = ~9220 chars */
+  char *stdin_buf = malloc(FROST_MAX_PAYLOAD * 4);
+  if (!stdin_buf) {
+    perror("malloc mint stdin");
+    return -1;
+  }
+
+  /* After (4 lines — add pub_key_pkg hex so mint embeds the correct CA key): */
+  char pub_pkg_hex[FROST_MAX_PAYLOAD * 2 + 4];
+  bytes_to_hex(g_pub_key_pkg, g_pub_key_pkg_len, pub_pkg_hex);
+  int n = snprintf(stdin_buf, FROST_MAX_PAYLOAD * 4, "%s\n%s\n%s\n%s\n",
+                   g_dummy_cert, sig_hex, g_tbs_hex, pub_pkg_hex);
+  if (n <= 0) {
+    fprintf(stderr, "coordinator: mint stdin format failed\n");
+    free(stdin_buf);
+    return -1;
+  }
+
+  char tmpfile[] = "/tmp/frost_mint_XXXXXX";
+  int tmpfd = mkstemp(tmpfile);
+  if (tmpfd < 0) {
+    perror("mkstemp mint");
+    free(stdin_buf);
+    return -1;
+  }
+  if (write(tmpfd, stdin_buf, (size_t)n) < 0) {
+    perror("write mint");
+    close(tmpfd);
+    unlink(tmpfile);
+    free(stdin_buf);
+    return -1;
+  }
+  close(tmpfd);
+  free(stdin_buf);
+
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " mint < %s", tmpfile);
+  FILE *fp = popen(cmd, "r");
+  if (!fp) {
+    perror("popen mint");
+    unlink(tmpfile);
+    return -1;
+  }
+
+  /* The certificate line can be ~900 chars */
+  char cert_line[FROST_MAX_PAYLOAD];
+  if (!fgets(cert_line, sizeof(cert_line), fp)) {
+    fprintf(stderr, "coordinator: mint produced no output\n");
+    pclose(fp);
+    unlink(tmpfile);
+    return -1;
+  }
+  cert_line[strcspn(cert_line, "\r\n")] = '\0';
+
+  int exit_code = pclose(fp);
+  unlink(tmpfile);
+
+  if (exit_code != 0) {
+    fprintf(stderr, "coordinator: mint command failed (exit %d)\n", exit_code);
+    return -1;
+  }
+
+  /* Write certificate to output file */
+  FILE *out = fopen(g_output_file, "w");
+  if (!out) {
+    perror(g_output_file);
+    return -1;
+  }
+  fprintf(out, "%s\n", cert_line);
+  fclose(out);
+
+  printf("coordinator: *** SSH certificate written → %s ***\n", g_output_file);
+  printf("coordinator: inspect: ssh-keygen -L -f %s\n", g_output_file);
+  return 0;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * Network send helpers
+ * ══════════════════════════════════════════════════════════════════ */
+
+static void signer_send(struct signer *sg, frost_msg_t type,
+                        const uint8_t *payload, uint16_t plen) {
   struct outmsg *m = malloc(sizeof(*m));
   if (!m)
     return;
@@ -498,8 +379,8 @@ static void signer_queue_frame(struct signer *sg, frost_msg_t type,
   TAILQ_INSERT_TAIL(&sg->msgq, m, entries);
 }
 
-static void staged_queue_frame(struct staged_conn *st, frost_msg_t type,
-                               const uint8_t *payload, uint16_t plen) {
+static void staged_send(struct staged_conn *st, frost_msg_t type,
+                        const uint8_t *payload, uint16_t plen) {
   struct outmsg *m = malloc(sizeof(*m));
   if (!m)
     return;
@@ -514,25 +395,26 @@ static void staged_queue_frame(struct staged_conn *st, frost_msg_t type,
   TAILQ_INSERT_TAIL(&st->msgq, m, entries);
 }
 
+static void drain_signer_write(struct signer *sg, struct signerlist *list);
+static void drain_staged_write(struct staged_conn *st, struct stagedlist *list);
+static void remove_signer(struct signerlist *list, struct signer *sg);
+static void remove_staged(struct stagedlist *list, struct staged_conn *st);
+
 static void drain_signer_write(struct signer *sg, struct signerlist *list) {
   struct outmsg *m = TAILQ_FIRST(&sg->msgq);
   if (!m)
     return;
-
-  int ret =
-      gnutls_record_send(sg->session, m->data + m->sent, m->len - m->sent);
-  if (ret == GNUTLS_E_AGAIN || ret == GNUTLS_E_INTERRUPTED) {
+  int r = gnutls_record_send(sg->session, m->data + m->sent, m->len - m->sent);
+  if (r == GNUTLS_E_AGAIN || r == GNUTLS_E_INTERRUPTED) {
     sg->want_write = gnutls_record_get_direction(sg->session);
     return;
   }
-  if (ret < 0) {
-    fprintf(stderr, "coordinator: write error to signer %u: %s\n", sg->id,
-            gnutls_strerror(ret));
+  if (r < 0) {
     remove_signer(list, sg);
     return;
   }
   sg->want_write = 0;
-  m->sent += (size_t)ret;
+  m->sent += (size_t)r;
   if (m->sent >= m->len) {
     TAILQ_REMOVE(&sg->msgq, m, entries);
     free(m->data);
@@ -545,30 +427,27 @@ static void drain_staged_write(struct staged_conn *st,
   struct outmsg *m = TAILQ_FIRST(&st->msgq);
   if (!m)
     return;
-
-  int ret =
-      gnutls_record_send(st->session, m->data + m->sent, m->len - m->sent);
-  if (ret == GNUTLS_E_AGAIN || ret == GNUTLS_E_INTERRUPTED) {
+  int r = gnutls_record_send(st->session, m->data + m->sent, m->len - m->sent);
+  if (r == GNUTLS_E_AGAIN || r == GNUTLS_E_INTERRUPTED) {
     st->want_write = gnutls_record_get_direction(st->session);
     return;
   }
-  if (ret < 0) {
+  if (r < 0) {
     remove_staged(list, st);
     return;
   }
   st->want_write = 0;
-  m->sent += (size_t)ret;
+  m->sent += (size_t)r;
   if (m->sent >= m->len) {
     TAILQ_REMOVE(&st->msgq, m, entries);
     free(m->data);
     free(m);
-    /* after sending error/reject, close staged connection */
-    remove_staged(list, st);
+    remove_staged(list, st); /* close after flushing staged error */
   }
 }
 
 static void remove_signer(struct signerlist *list, struct signer *sg) {
-  printf("coordinator: removing signer %u\n", sg->id);
+  printf("coordinator: signer %u disconnected\n", sg->id);
   struct outmsg *m, *tmp;
   TAILQ_FOREACH_SAFE(m, &sg->msgq, entries, tmp) {
     TAILQ_REMOVE(&sg->msgq, m, entries);
@@ -580,10 +459,10 @@ static void remove_signer(struct signerlist *list, struct signer *sg) {
   close(sg->sockfd);
   LIST_REMOVE(sg, entries);
   free(sg);
+  (void)list;
 }
 
 static void remove_staged(struct stagedlist *list, struct staged_conn *st) {
-  printf("coordinator: removing staged connection %d\n", st->sockfd);
   struct outmsg *m, *tmp;
   TAILQ_FOREACH_SAFE(m, &st->msgq, entries, tmp) {
     TAILQ_REMOVE(&st->msgq, m, entries);
@@ -598,416 +477,698 @@ static void remove_staged(struct stagedlist *list, struct staged_conn *st) {
   (void)list;
 }
 
-/* Called when a new signer is promoted — check if we have n signers. */
+/* ══════════════════════════════════════════════════════════════════
+ * DKG mode helpers  (unchanged logic from original)
+ * ══════════════════════════════════════════════════════════════════ */
+
 static void maybe_start_dkg(struct signerlist *list) {
   if (g_dkg_state != DKG_IDLE)
     return;
-
   int count = 0;
   struct signer *sg, *tmp;
   LIST_FOREACH_SAFE(sg, list, entries, tmp) count++;
-
   if (count < (int)g_n) {
     printf("coordinator: %d/%u signers registered, waiting…\n", count, g_n);
     return;
   }
-
   printf("coordinator: all %u signers ready — broadcasting START_DKG\n", g_n);
   g_dkg_state = DKG_COLLECTING_R1;
-
-  char startbuf[32];
-  int startlen =
-      snprintf(startbuf, sizeof(startbuf), "START_DKG %u %u\n", g_n, g_t);
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    signer_queue_frame(sg, FROST_MSG_START_DKG, (uint8_t *)startbuf,
-                       (uint16_t)startlen);
-  }
+  char buf[32];
+  int blen = snprintf(buf, sizeof(buf), "START_DKG %u %u\n", g_n, g_t);
+  LIST_FOREACH_SAFE(sg, list, entries, tmp)
+  signer_send(sg, FROST_MSG_START_DKG, (uint8_t *)buf, (uint16_t)blen);
 }
 
-/* Broadcast signer sg's round-1 package to every other signer. */
 static void relay_r1_to_all(struct signerlist *list, struct signer *sender) {
-  /* prepend sender ID so receivers know who sent it */
   uint8_t relay[FROST_MAX_PAYLOAD + 2];
   relay[0] = (uint8_t)(sender->id >> 8);
   relay[1] = (uint8_t)(sender->id & 0xFF);
   memcpy(relay + 2, sender->r1_pkg, sender->r1_len);
   uint16_t rlen = (uint16_t)(sender->r1_len + 2);
-
   struct signer *sg, *tmp;
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    if (sg->id == sender->id)
-      continue;
-    signer_queue_frame(sg, FROST_MSG_RELAY_R1, relay, rlen);
-  }
+  LIST_FOREACH_SAFE(sg, list, entries, tmp)
+  if (sg->id != sender->id)
+    signer_send(sg, FROST_MSG_RELAY_R1, relay, rlen);
 }
 
-/* Unicast a round-2 package to the signer with the given target_id. */
 static void relay_r2_to_target(struct signerlist *list, uint16_t target_id,
                                const uint8_t *payload, uint16_t plen) {
   struct signer *sg, *tmp;
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    if (sg->id == target_id) {
-      signer_queue_frame(sg, FROST_MSG_RELAY_R2, payload, plen);
-      return;
-    }
+  LIST_FOREACH_SAFE(sg, list, entries, tmp)
+  if (sg->id == target_id) {
+    signer_send(sg, FROST_MSG_RELAY_R2, payload, plen);
+    return;
   }
-  fprintf(stderr, "coordinator: relay_r2: target %u not found\n", target_id);
+  fprintf(stderr, "coordinator: relay_r2 target %u not found\n", target_id);
 }
 
-/* Check if all round-1 packages are in; if so, relay to everyone. */
 static void check_r1_complete(struct signerlist *list) {
-  int have = 0, need = (int)g_n;
-  struct signer *sg, *tmp;
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    if (sg->r1_len > 0)
-      have++;
-  }
-  if (have < need) {
-    printf("coordinator: r1 %d/%d collected\n", have, need);
-    return;
-  }
-  printf("coordinator: all r1 packages collected — relaying\n");
-  g_dkg_state = DKG_COLLECTING_R2;
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) { relay_r1_to_all(list, sg); }
-}
-
-/* Check if all commitments are in; if so, assemble signing package. */
-static void check_commits_complete(struct signerlist *list, const uint8_t *tbs,
-                                   uint16_t tbs_len) {
-
-  /* Only assemble once — if already in SIGNING state, ignore late commits */
-  if (g_dkg_state == DKG_SIGN_SENT) {
-    printf("coordinator: late commit ignored — signing package already sent\n");
-    return;
-  }
-
   int have = 0;
   struct signer *sg, *tmp;
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    if (sg->commit_len > 0)
-      have++;
-  }
-  if (have < (int)g_t) {
-    printf("coordinator: commits %d/%u collected\n", have, g_t);
+  LIST_FOREACH_SAFE(sg, list, entries, tmp) if (sg->r1_len > 0) have++;
+  if (have < (int)g_n) {
+    printf("coordinator: r1 %d/%u\n", have, g_n);
     return;
   }
-  printf("coordinator: %d commits collected — assembling signing package\n",
-         have);
+  printf("coordinator: all r1 packages — relaying\n");
+  g_dkg_state = DKG_COLLECTING_R2;
+  LIST_FOREACH_SAFE(sg, list, entries, tmp) relay_r1_to_all(list, sg);
+}
 
-  /* Build stdin for frost_signer_core assemble:
-   *   line 1: hex(tbs)
-   *   line 2: t (number of commits)
-   *   lines 3..t+2: "<id> <hex(commit)>"
-   */
-  char assemble_stdin[FROST_MAX_PAYLOAD * FROST_MAX_SIGNERS * 3];
-  size_t off = 0;
+static void check_r2_complete(struct signerlist *list) {
+  int have = 0;
+  struct signer *sg, *tmp;
+  LIST_FOREACH_SAFE(sg, list, entries, tmp) if (sg->r2_complete) have++;
+  printf("coordinator: R2_COMPLETE %d/%u\n", have, g_n);
+  if (have < (int)g_n)
+    return;
+  printf("coordinator: DKG complete — broadcasting DKG_DONE\n");
+  char buf[32];
+  int blen = snprintf(buf, sizeof(buf), "DKG_DONE %u\n", g_n);
+  LIST_FOREACH_SAFE(sg, list, entries, tmp)
+  signer_send(sg, FROST_MSG_DKG_DONE, (uint8_t *)buf, (uint16_t)blen);
+  g_dkg_state = DKG_COMPLETE;
+}
 
-  // fprintf(stdout, "%s\n", tbs);
+/* ══════════════════════════════════════════════════════════════════
+ * Refresh DKG mode helpers
+ * ══════════════════════════════════════════════════════════════════ */
 
-  /* line 1: TBS hex */
-  char tbs_hex[FROST_MAX_PAYLOAD * 2 + 2];
-  bytes_to_hex(tbs, tbs_len, tbs_hex);
-  off += (size_t)snprintf(assemble_stdin + off, sizeof(assemble_stdin) - off,
-                          "%s\n", tbs_hex);
+static void maybe_start_refresh(struct signerlist *list) {
+  if (g_dkg_state != DKG_IDLE)
+    return;
+  int count = 0;
+  struct signer *sg, *tmp;
+  LIST_FOREACH_SAFE(sg, list, entries, tmp) count++;
+  if (count < (int)g_n) {
+    printf("coordinator: [REFRESH] %d/%u signers, waiting...\n", count, g_n);
+    return;
+  }
+  printf("coordinator: [REFRESH] all %u signers ready — broadcasting "
+         "START_REFRESH\n",
+         g_n);
+  g_dkg_state = DKG_COLLECTING_R1;
+  char buf[32];
+  int blen = snprintf(buf, sizeof(buf), "START_REFRESH %u %u\n", g_n, g_t);
+  LIST_FOREACH_SAFE(sg, list, entries, tmp)
+  signer_send(sg, FROST_MSG_START_REFRESH, (uint8_t *)buf, (uint16_t)blen);
+}
 
-  /* line 2: t */
-  off += (size_t)snprintf(assemble_stdin + off, sizeof(assemble_stdin) - off,
-                          "%u\n", (unsigned)g_t);
+static void relay_refresh_r1_to_all(struct signerlist *list,
+                                    struct signer *sender) {
+  uint8_t relay[FROST_MAX_PAYLOAD + 2];
+  relay[0] = (uint8_t)(sender->id >> 8);
+  relay[1] = (uint8_t)(sender->id & 0xFF);
+  memcpy(relay + 2, sender->r1_pkg, sender->r1_len);
+  uint16_t rlen = (uint16_t)(sender->r1_len + 2);
+  struct signer *sg, *tmp;
+  LIST_FOREACH_SAFE(sg, list, entries, tmp)
+  if (sg->id != sender->id)
+    signer_send(sg, FROST_MSG_RELAY_REFRESH_R1, relay, rlen);
+}
 
-  /* lines 3..t+2: one per participating signer */
-  int sent = 0;
+static void check_refresh_r1_complete(struct signerlist *list) {
+  int have = 0;
+  struct signer *sg, *tmp;
+  LIST_FOREACH_SAFE(sg, list, entries, tmp) if (sg->r1_len > 0) have++;
+  if (have < (int)g_n) {
+    printf("coordinator: [REFRESH] r1 %d/%u\n", have, g_n);
+    return;
+  }
+  printf("coordinator: [REFRESH] all r1 — relaying\n");
+  g_dkg_state = DKG_COLLECTING_R2;
+  LIST_FOREACH_SAFE(sg, list, entries, tmp) relay_refresh_r1_to_all(list, sg);
+}
+
+static void check_refresh_r2_complete(struct signerlist *list) {
+  int have = 0;
+  struct signer *sg, *tmp;
+  LIST_FOREACH_SAFE(sg, list, entries, tmp) if (sg->r2_complete) have++;
+  printf("coordinator: [REFRESH] r2_complete %d/%u\n", have, g_n);
+  if (have < (int)g_n)
+    return;
+
+  printf(
+      "coordinator: [REFRESH] all r2 done — broadcasting REFRESH_FINALIZE\n");
+  LIST_FOREACH_SAFE(sg, list, entries, tmp)
+  signer_send(sg, FROST_MSG_REFRESH_FINALIZE, NULL, 0);
+  g_dkg_state = DKG_COMPLETE;
+}
+
+static void check_refresh_all_confirmed(struct signerlist *list) {
+  if (g_refresh_complete_count < (int)g_n)
+    return;
+  printf("coordinator: [REFRESH] all %u signers refreshed — broadcasting "
+         "CONFIRMED\n",
+         g_n);
+  struct signer *sg, *tmp;
+  LIST_FOREACH_SAFE(sg, list, entries, tmp)
+  signer_send(sg, FROST_MSG_REFRESH_CONFIRMED, NULL, 0);
+  g_signing_done = 1; /* reuse flag to signal coordinator exit */
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * ROAST session management
+ * ══════════════════════════════════════════════════════════════════ */
+
+static int is_blacklisted(uint16_t id) {
+  for (int i = 0; i < g_n_blacklisted; i++)
+    if (g_blacklist[i] == id)
+      return 1;
+  return 0;
+}
+
+static void blacklist_signer(uint16_t id) {
+  if (g_n_blacklisted >= FROST_MAX_SIGNERS || is_blacklisted(id))
+    return;
+  g_blacklist[g_n_blacklisted++] = id;
+  printf("coordinator: [ROAST] signer %u blacklisted\n", id);
+}
+
+static struct roast_session *roast_alloc(void) {
+  for (int i = 0; i < ROAST_MAX_SESSIONS; i++)
+    if (g_sessions[i].state == RSESS_EMPTY)
+      return &g_sessions[i];
+  return NULL;
+}
+
+static int roast_active_count(void) {
+  int n = 0;
+  for (int i = 0; i < ROAST_MAX_SESSIONS; i++)
+    if (g_sessions[i].state == RSESS_AWAITING_SHARES)
+      n++;
+  return n;
+}
+
+static struct roast_session *roast_find(uint32_t sid) {
+  for (int i = 0; i < ROAST_MAX_SESSIONS; i++)
+    if (g_sessions[i].id == sid)
+      return &g_sessions[i];
+  return NULL;
+}
+
+static int roast_signer_slot(const struct roast_session *s, uint16_t id) {
+  for (int i = 0; i < s->n_signers; i++)
+    if (s->signer_ids[i] == id)
+      return i;
+  return -1;
+}
+
+/*  Broadcast a fresh SIGN_REQ to all non-blacklisted, key-holding signers
+ *  and reset their sign_phase so they generate new commits.
+ *  Called at startup and again after every failed ROAST session.
+ */
+static void broadcast_sign_req(struct signerlist *list) {
+  struct signer *sg, *tmp;
   LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    if (sg->commit_len == 0)
+    if (is_blacklisted(sg->id) || sg->sign_phase == SPHASE_NO_KEY)
       continue;
-    if (sent >= (int)g_t)
-      break;
-    char commit_hex[FROST_MAX_PAYLOAD * 2 + 2];
-    bytes_to_hex(sg->commit, sg->commit_len, commit_hex);
-    off += (size_t)snprintf(assemble_stdin + off, sizeof(assemble_stdin) - off,
-                            "%u %s\n", (unsigned)sg->id, commit_hex);
-    sent++;
+    sg->sign_phase = SPHASE_INIT;
+    sg->commit_len = 0;
+    sg->sig_share_len = 0;
+    sg->session_id = 0;
+    signer_send(sg, FROST_MSG_SIGN_REQ, g_tbs, g_tbs_len);
+    printf("coordinator: [ROAST] SIGN_REQ → signer %u\n", sg->id);
+  }
+}
+
+/*  Form one ROAST session from the first t SPHASE_COMMITTED, non-blacklisted
+ *  signers.  Calls frost_signer_core assemble to build a signing package
+ *  for that specific subset, then sends it to each member.
+ *  Returns 1 if a session was started, 0 otherwise.
+ */
+static int roast_try_form_session(struct signerlist *list) {
+  if (g_signing_done)
+    return 0;
+
+  struct roast_session *sess = roast_alloc();
+  if (!sess) {
+    printf("coordinator: [ROAST] no free session slots\n");
+    return 0;
   }
 
-  /* Write to temp file and call frost_signer_core assemble */
+  /* ── Two-pass selection ─────────────────────────────────────────
+   * Pass 1: zero-strike committed signers  (proven reliable)
+   * Pass 2: suspect committed signers      (struck but not blacklisted)
+   * This ensures sessions are composed of the most trustworthy nodes
+   * available, falling back to suspects only when necessary.       */
+  uint16_t chosen[FROST_MAX_SIGNERS];
+  int n_chosen = 0;
+
+  struct signer *sg, *tmp;
+  /* Pass 1 — reliable (zero strikes, SPHASE_COMMITTED) */
+  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
+    if (n_chosen >= (int)g_t)
+      break;
+    if (sg->sign_phase == SPHASE_COMMITTED && !is_blacklisted(sg->id) &&
+        sg->commit_len > 0 && get_strikes(sg->id) == 0)
+      chosen[n_chosen++] = sg->id;
+  }
+
+  /* Pass 2 — suspects (non-zero strikes, SPHASE_COMMITTED or SPHASE_SUSPECT)
+   * SPHASE_SUSPECT signers that committed this round have already moved
+   * back to SPHASE_COMMITTED in the COMMIT handler, so check both.  */
+  if (n_chosen < (int)g_t) {
+    LIST_FOREACH_SAFE(sg, list, entries, tmp) {
+      if (n_chosen >= (int)g_t)
+        break;
+      if ((sg->sign_phase == SPHASE_COMMITTED ||
+           sg->sign_phase == SPHASE_SUSPECT) &&
+          sg->commit_len > 0 && !is_blacklisted(sg->id) &&
+          get_strikes(sg->id) > 0) {
+        /* avoid duplicates from pass 1 */
+        int dup = 0;
+        for (int ci = 0; ci < n_chosen; ci++)
+          if (chosen[ci] == sg->id) {
+            dup = 1;
+            break;
+          }
+        if (!dup)
+          chosen[n_chosen++] = sg->id;
+      }
+    }
+  }
+
+  if (n_chosen < (int)g_t)
+    return 0;
+
+  printf("coordinator: [ROAST] session %u selection — "
+         "reliable=%d suspect=%d\n",
+         g_next_session_id,
+         /* count how many of the chosen have zero strikes */
+         ({
+           int r = 0;
+           for (int ci = 0; ci < n_chosen; ci++)
+             if (get_strikes(chosen[ci]) == 0)
+               r++;
+           r;
+         }),
+         ({
+           int s2 = 0;
+           for (int ci = 0; ci < n_chosen; ci++)
+             if (get_strikes(chosen[ci]) > 0)
+               s2++;
+           s2;
+         }));
+
+  /* Build stdin for frost_signer_core assemble:
+   *   line 1: hex(TBS)
+   *   line 2: t
+   *   lines 3..t+2: "<id> <hex(commit)>"
+   */
+  char assemble_in[FROST_MAX_PAYLOAD * FROST_MAX_SIGNERS * 3];
+  size_t off = 0;
+  off += (size_t)snprintf(assemble_in + off, sizeof(assemble_in) - off,
+                          "%s\n%u\n", g_tbs_hex, (unsigned)g_t);
+  for (int ci = 0; ci < n_chosen; ci++) {
+    LIST_FOREACH_SAFE(sg, list, entries, tmp) {
+      if (sg->id != chosen[ci])
+        continue;
+      char commit_hex[FROST_MAX_PAYLOAD * 2 + 2];
+      bytes_to_hex(sg->commit, sg->commit_len, commit_hex);
+      off += (size_t)snprintf(assemble_in + off, sizeof(assemble_in) - off,
+                              "%u %s\n", (unsigned)sg->id, commit_hex);
+      break;
+    }
+  }
+
   char tmpfile[] = "/tmp/frost_assemble_XXXXXX";
   int tmpfd = mkstemp(tmpfile);
   if (tmpfd < 0) {
-    // static uint8_t g_signing_pkg[FROST_MAX_PAYLOAD];
-    // static uint16_t g_signing_pkg_len = 0;
-    // static uint8_t g_pub_key_pkg[FROST_MAX_PAYLOAD];
-    // static uint16_t g_pub_key_pkg_len = 0;
-    perror("coordinator: mkstemp assemble");
-    return;
+    perror("mkstemp assemble");
+    return 0;
   }
-  fprintf(stderr, "coordinator: assemble stdin (%zu bytes):\n%s\n---\n", off,
-          assemble_stdin);
-  write(tmpfd, assemble_stdin, off);
+  write(tmpfd, assemble_in, off);
   close(tmpfd);
 
-  char assemble_cmd[256];
-  snprintf(assemble_cmd, sizeof(assemble_cmd), FROST_CORE_BIN " assemble < %s",
-           tmpfile);
-
-  FILE *fp = popen(assemble_cmd, "r");
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " assemble < %s", tmpfile);
+  FILE *fp = popen(cmd, "r");
   if (!fp) {
-    perror("coordinator: popen assemble");
+    perror("popen assemble");
     unlink(tmpfile);
-    return;
+    return 0;
   }
 
   char spkg_hex[FROST_MAX_PAYLOAD * 2 + 4];
-  if (fgets(spkg_hex, sizeof(spkg_hex), fp) == NULL) {
-    fprintf(stderr, "coordinator: assemble produced no output\n");
+  if (!fgets(spkg_hex, sizeof(spkg_hex), fp)) {
+    fprintf(stderr, "coordinator: [ROAST] assemble produced no output\n");
     pclose(fp);
     unlink(tmpfile);
-    return;
+    return 0;
   }
-  pclose(fp);
+  int exit_code = pclose(fp);
   unlink(tmpfile);
+  if (exit_code != 0) {
+    fprintf(stderr, "coordinator: [ROAST] assemble failed (exit %d)\n",
+            exit_code);
+    return 0;
+  }
 
-  /* Decode the postcard SigningPackage bytes */
   uint8_t spkg[FROST_MAX_PAYLOAD];
   int spkg_len = hex_to_bytes(spkg_hex, spkg, FROST_MAX_PAYLOAD);
-  if (spkg_len < 0) {
-    fprintf(stderr, "coordinator: assemble hex decode failed\n");
-    return;
+  if (spkg_len <= 0) {
+    fprintf(stderr, "coordinator: [ROAST] assemble hex decode failed\n");
+    return 0;
   }
 
-  memcpy(g_signing_pkg, spkg, (size_t)spkg_len);
-  g_signing_pkg_len = (uint16_t)spkg_len;
+  /* Populate session record */
+  sess->id = g_next_session_id++;
+  sess->state = RSESS_AWAITING_SHARES;
+  sess->deadline = time(NULL) + ROAST_SESSION_TIMEOUT_SEC;
+  sess->n_signers = n_chosen;
+  sess->signing_pkg_len = (uint16_t)spkg_len;
+  sess->n_shares = 0;
+  memcpy(sess->signing_pkg, spkg, (size_t)spkg_len);
+  memcpy(sess->signer_ids, chosen, (size_t)n_chosen * sizeof(uint16_t));
+  memset(sess->shares, 0, sizeof(sess->shares));
+  memset(sess->share_lens, 0, sizeof(sess->share_lens));
 
-  printf("coordinator: broadcasting signing package (%d bytes)\n", spkg_len);
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    if (sg->commit_len == 0)
-      continue;
-    signer_queue_frame(sg, FROST_MSG_RELAY_COMMIT, spkg, (uint16_t)spkg_len);
-  }
-  g_dkg_state = DKG_SIGN_SENT;
-
-  /* Build a flat signing package:
-   *   [uint16_t tbs_len][tbs_bytes]
-   *   [uint16_t n_commits]
-   *   for each commit: [uint16_t signer_id][uint16_t commit_len][commit_bytes]
-   */
-  /*uint8_t spkg[FROST_MAX_PAYLOAD];
-  size_t off = 0;
-
-  spkg[off++] = (uint8_t)(tbs_len >> 8);
-  spkg[off++] = (uint8_t)(tbs_len & 0xFF);
-  if (off + tbs_len > FROST_MAX_PAYLOAD) {
-    fprintf(stderr, "coordinator: TBS too large for signing package\n");
-    return;
-  }
-  memcpy(spkg + off, tbs, tbs_len);
-  off += tbs_len;
-
-  uint16_t n_commits = (uint16_t)have;
-  spkg[off++] = (uint8_t)(n_commits >> 8);
-  spkg[off++] = (uint8_t)(n_commits & 0xFF);
-
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    if (sg->commit_len == 0)
-      continue;
-    spkg[off++] = (uint8_t)(sg->id >> 8);
-    spkg[off++] = (uint8_t)(sg->id & 0xFF);
-    spkg[off++] = (uint8_t)(sg->commit_len >> 8);
-    spkg[off++] = (uint8_t)(sg->commit_len & 0xFF);
-    if (off + sg->commit_len > FROST_MAX_PAYLOAD)
+  /* Mark chosen signers IN_SESSION and send signing package */
+  for (int ci = 0; ci < n_chosen; ci++) {
+    LIST_FOREACH_SAFE(sg, list, entries, tmp) {
+      if (sg->id != chosen[ci])
+        continue;
+      sg->sign_phase = SPHASE_IN_SESSION;
+      sg->session_id = sess->id;
+      signer_send(sg, FROST_MSG_RELAY_COMMIT, spkg, (uint16_t)spkg_len);
       break;
-    memcpy(spkg + off, sg->commit, sg->commit_len);
-    off += sg->commit_len;
+    }
   }
 
-  printf("coordinator: broadcasting signing package (%zu bytes)\n", off);
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    if (sg->commit_len == 0)
-      continue;
-    signer_queue_frame(sg, FROST_MSG_RELAY_COMMIT, spkg, (uint16_t)off);
-  }
-  g_dkg_state = DKG_SIGNING;*/
+  printf("coordinator: [ROAST] session %u formed — signers {", sess->id);
+  for (int ci = 0; ci < n_chosen; ci++)
+    printf("%u%s", chosen[ci], ci < n_chosen - 1 ? "," : "");
+  printf("}\n");
+  return 1;
 }
 
-/* Check if t signature shares are in; log aggregate trigger. */
-static void maybe_aggregate(struct signerlist *list) {
-  int have = 0;
-  struct signer *sg, *tmp;
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    if (sg->sig_share_len > 0)
-      have++;
-  }
-  if (have < (int)g_t) {
-    printf("coordinator: sig shares %d/%u\n", have, g_t);
-    return;
-  }
-  printf("coordinator: %d signature shares collected -- aggregating\n", have);
-  // printf("coordinator: *** relay shares to aggregator signer or invoke FROST
-  // "
-  //        "aggregate ***\n");
-  /* In a full integration, call the Rust frost_signer binary here via popen,
-   * passing all shares, and relay the final 64-byte signature back.
-   * For now, log the event — the aggregator signer receives all shares
-   * via RELAY_R2 and produces the final sig independently. */
-  // g_dkg_state = DKG_COMPLETE;
+/*  Identifiable abort: only blacklist the named culprit.
+ *  Every other signer in the session is innocent and is reset to INIT
+ *  so they can immediately participate in the next session.           */
+static void roast_fail_culprit(struct signerlist *list,
+                               struct roast_session *sess,
+                               uint16_t culprit_id) {
+  sess->state = RSESS_FAILED;
+  printf("coordinator: [ROAST] identifiable abort — culprit signer %u\n",
+         culprit_id);
 
-  if (g_signing_pkg_len == 0) {
+  /* Blacklist the culprit */
+  blacklist_signer(culprit_id);
+  {
+    struct signer *sg, *tmp;
+    LIST_FOREACH_SAFE(sg, list, entries, tmp) {
+      if (sg->id == culprit_id) {
+        sg->sign_phase = SPHASE_BLACKLISTED;
+        break;
+      }
+    }
+  }
+
+  /* Reset every innocent session member and re-issue SIGN_REQ */
+  for (int si = 0; si < sess->n_signers; si++) {
+    uint16_t sid = sess->signer_ids[si];
+    if (sid == culprit_id)
+      continue;
+    struct signer *sg, *tmp;
+    LIST_FOREACH_SAFE(sg, list, entries, tmp) {
+      if (sg->id != sid)
+        continue;
+      sg->sign_phase = SPHASE_INIT;
+      sg->commit_len = 0;
+      sg->sig_share_len = 0;
+      sg->session_id = 0;
+      signer_send(sg, FROST_MSG_SIGN_REQ, g_tbs, g_tbs_len);
+      printf("coordinator: [ROAST] signer %u reset (innocent)\n", sg->id);
+      break;
+    }
+  }
+
+  /* Check we still have enough eligible signers */
+  int remaining = 0;
+  {
+    struct signer *sg, *tmp;
+    LIST_FOREACH_SAFE(sg, list, entries, tmp)
+    if (!is_blacklisted(sg->id) && sg->sign_phase != SPHASE_NO_KEY)
+      remaining++;
+  }
+  if (remaining < (int)g_t) {
     fprintf(stderr,
-            "coordinator: aggregate failed — no signing package stored\n");
+            "coordinator: [ROAST] only %d signer(s) remain — signing FAILED\n",
+            remaining);
+    g_signing_done = 1;
     return;
   }
-  if (g_pub_key_pkg_len == 0) {
-    fprintf(stderr,
-            "coordinator: aggregate failed — no public key package stored\n");
+  if (!g_signing_done && roast_active_count() < ROAST_MAX_SESSIONS)
+    roast_try_form_session(list);
+}
+
+/*  Try to aggregate shares for session `sess`.
+ *  On success: calls mint and writes the SSH certificate.
+ *  On failure: blacklists the session's signers and re-issues SIGN_REQ.
+ */
+static void roast_try_aggregate(struct signerlist *list,
+                                struct roast_session *sess) {
+  if (sess->n_shares < (int)g_t || g_signing_done)
     return;
-  }
 
   /* Build stdin for frost_signer_core aggregate:
    *   line 1: hex(SigningPackage)
    *   line 2: hex(PublicKeyPackage)
-   *   lines 3..t+2: "<signer_id> <hex(SignatureShare)>"
+   *   lines 3..t+2: "<id> <hex(share)>"
    */
-  char agg_stdin[FROST_MAX_PAYLOAD * FROST_MAX_SIGNERS * 3];
+  char agg_in[FROST_MAX_PAYLOAD * FROST_MAX_SIGNERS * 3];
   size_t off = 0;
 
   char spkg_hex[FROST_MAX_PAYLOAD * 2 + 2];
-  bytes_to_hex(g_signing_pkg, g_signing_pkg_len, spkg_hex);
-  off += (size_t)snprintf(agg_stdin + off, sizeof(agg_stdin) - off, "%s\n",
-                          spkg_hex);
+  bytes_to_hex(sess->signing_pkg, sess->signing_pkg_len, spkg_hex);
+  off += (size_t)snprintf(agg_in + off, sizeof(agg_in) - off, "%s\n", spkg_hex);
 
   char pub_hex[FROST_MAX_PAYLOAD * 2 + 2];
   bytes_to_hex(g_pub_key_pkg, g_pub_key_pkg_len, pub_hex);
-  off += (size_t)snprintf(agg_stdin + off, sizeof(agg_stdin) - off, "%s\n",
-                          pub_hex);
+  off += (size_t)snprintf(agg_in + off, sizeof(agg_in) - off, "%s\n", pub_hex);
 
-  int sent = 0;
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    if (sg->sig_share_len == 0)
+  for (int si = 0; si < sess->n_signers; si++) {
+    if (sess->share_lens[si] == 0)
       continue;
-    if (sent >= (int)g_t)
-      break;
-    char share_hex[FROST_MAX_PAYLOAD * 2 + 2];
-    bytes_to_hex(sg->sig_share, sg->sig_share_len, share_hex);
-    off += (size_t)snprintf(agg_stdin + off, sizeof(agg_stdin) - off, "%u %s\n",
-                            (unsigned)sg->id, share_hex);
-    sent++;
+    char sh_hex[FROST_MAX_PAYLOAD * 2 + 2];
+    bytes_to_hex(sess->shares[si], sess->share_lens[si], sh_hex);
+    off += (size_t)snprintf(agg_in + off, sizeof(agg_in) - off, "%u %s\n",
+                            (unsigned)sess->signer_ids[si], sh_hex);
   }
 
-  /* Write stdin to temp file */
-  char tmpfile[] = "/tmp/frost_aggregate_XXXXXX";
+  char tmpfile[] = "/tmp/frost_agg_XXXXXX";
   int tmpfd = mkstemp(tmpfile);
   if (tmpfd < 0) {
-    perror("coordinator: mkstemp aggregate");
+    perror("mkstemp aggregate");
     return;
   }
-  write(tmpfd, agg_stdin, off);
+  write(tmpfd, agg_in, off);
   close(tmpfd);
 
-  char agg_cmd[256];
-  snprintf(agg_cmd, sizeof(agg_cmd), FROST_CORE_BIN " aggregate --t %u < %s",
+  char cmd[256];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " aggregate --t %u < %s",
            (unsigned)g_t, tmpfile);
-
-  FILE *fp = popen(agg_cmd, "r");
+  FILE *fp = popen(cmd, "r");
   if (!fp) {
-    perror("coordinator: popen aggregate");
+    perror("popen aggregate");
     unlink(tmpfile);
     return;
   }
 
-  char sig_hex[FROST_MAX_PAYLOAD * 2 + 4];
-  if (fgets(sig_hex, sizeof(sig_hex), fp) == NULL) {
-    fprintf(stderr, "coordinator: aggregate produced no output\n");
-    pclose(fp);
-    unlink(tmpfile);
-    return;
-  }
-  pclose(fp);
+  /* was: char sig_hex[256]; */
+  char first_line[256] = {0};
+  int got_output = (fgets(first_line, sizeof(first_line), fp) != NULL);
+  int exit_code = pclose(fp);
   unlink(tmpfile);
 
-  /* Decode the 64-byte signature */
-  uint8_t sig[128];
-  int siglen = hex_to_bytes(sig_hex, sig, sizeof(sig));
-  if (siglen < 0) {
-    fprintf(stderr, "coordinator: aggregate hex decode failed\n");
-    return;
-  }
-  printf("coordinator: final signature (%d bytes): %.*s\n", siglen,
-         (int)strlen(sig_hex) - 1, sig_hex);
+  /* ── Success ────────────────────────────────────────────────── */
+  if (got_output && exit_code == 0 && strncmp(first_line, "CULPRIT:", 8) != 0) {
+    /* ── Success ── */
+    first_line[strcspn(first_line, "\r\n")] = '\0';
+    uint8_t sig64[64];
+    int slen = hex_to_bytes(first_line, sig64, sizeof(sig64));
+    if (slen != 64) {
+      fprintf(stderr, "coordinator: [ROAST] aggregate: unexpected sig len %d\n",
+              slen);
+      goto session_fail;
+    }
 
-  /* Broadcast to all signers */
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    signer_queue_frame(sg, FROST_MSG_FINAL_SIG, sig, (uint16_t)siglen);
-  }
+    sess->state = RSESS_COMPLETE;
+    g_signing_done = 1;
+    printf("coordinator: [ROAST] session %u *** AGGREGATE OK ***\n", sess->id);
 
-  g_dkg_state = DKG_COMPLETE;
-}
+    /* Produce the final SSH certificate via mint */
+    if (call_mint(sig64) != 0) {
+      fprintf(stderr, "coordinator: mint failed — certificate NOT written\n");
+      return;
+    }
 
-/* Count R2_COMPLETE notices; broadcast DKG_DONE when all n signers
- * have confirmed they received all round-2 packages. */
-static void check_r2_complete(struct signerlist *list) {
-  int have = 0;
-  struct signer *sg, *tmp;
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    if (sg->r2_complete)
-      have++;
-  }
-  printf("coordinator: R2_COMPLETE %d/%u\n", have, g_n);
-  if (have < (int)g_n)
-    return;
-
-  /* All n signers completed part3 — broadcast DKG_DONE */
-  printf("coordinator: all %u signers completed r2 — broadcasting DKG_DONE\n",
-         g_n);
-  char donebuf[32];
-  int donelen = snprintf(donebuf, sizeof(donebuf), "DKG_DONE %u\n", g_n);
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    signer_queue_frame(sg, FROST_MSG_DKG_DONE, (uint8_t *)donebuf,
-                       (uint16_t)donelen);
-  }
-  g_dkg_state = DKG_COMPLETE;
-}
-
-/* Broadcast a signing request to all registered signers. */
-static void maybe_broadcast_signing_pkg(struct signerlist *list,
-                                        const uint8_t *tbs, uint16_t tbs_len) {
-  if (g_dkg_state != DKG_COMPLETE) {
-    fprintf(stderr, "coordinator: SIGN_REQ ignored — DKG not complete\n");
+    /* Notify all signers */
+    struct signer *sg, *tmp;
+    LIST_FOREACH_SAFE(sg, list, entries, tmp)
+    signer_send(sg, FROST_MSG_CERT_OUTPUT, (uint8_t *)g_output_file,
+                (uint16_t)strlen(g_output_file));
     return;
   }
 
-  memcpy(g_tbs, tbs, tbs_len);
-  g_tbs_len = tbs_len;
+/* ── Failure path ───────────────────────────────────────────── */
+session_fail:;
+  first_line[strcspn(first_line, "\r\n")] = '\0';
 
-  printf("coordinator: broadcasting SIGN_REQ (%u TBS bytes)\n", tbs_len);
-  g_dkg_state = DKG_SIGNING;
-
-  /* reset per-signer signing state */
-  struct signer *sg, *tmp;
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    sg->commit_len = 0;
-    sg->sig_share_len = 0;
+  if (strncmp(first_line, "CULPRIT:", 8) == 0) {
+    /* ── Precise identifiable abort ──────────────────────────────
+     * The Rust binary identified exactly which share was invalid.
+     * Only that signer is blacklisted; all others are reset and
+     * re-issued SIGN_REQ so they can form a new session immediately.*/
+    uint16_t culprit_id = (uint16_t)atoi(first_line + 8);
+    if (culprit_id > 0 && culprit_id <= FROST_MAX_SIGNERS) {
+      roast_fail_culprit(list, sess, culprit_id);
+      return;
+    }
   }
 
-  /* send SIGN_REQ with raw TBS bytes as payload */
-  LIST_FOREACH_SAFE(sg, list, entries, tmp) {
-    signer_queue_frame(sg, FROST_MSG_SIGN_REQ, tbs, tbs_len);
+  /* ── Fallback: unknown failure — blacklist the whole session ───
+   * Reached only when the Rust binary did not identify a culprit
+   * (e.g. a deserialization error rather than an invalid share).  */
+  fprintf(stderr,
+          "coordinator: [ROAST] session %u unknown failure — "
+          "blacklisting all %d members\n",
+          sess->id, sess->n_signers);
+  sess->state = RSESS_FAILED;
+  for (int si = 0; si < sess->n_signers; si++) {
+    blacklist_signer(sess->signer_ids[si]);
+    struct signer *sg, *tmp;
+    LIST_FOREACH_SAFE(sg, list, entries, tmp) {
+      if (sg->id == sess->signer_ids[si]) {
+        sg->sign_phase = SPHASE_BLACKLISTED;
+        break;
+      }
+    }
+  }
+  int remaining = 0;
+  {
+    struct signer *sg, *tmp;
+    LIST_FOREACH_SAFE(sg, list, entries, tmp)
+    if (!is_blacklisted(sg->id) && sg->sign_phase != SPHASE_NO_KEY)
+      remaining++;
+  }
+  if (remaining < (int)g_t) {
+    fprintf(stderr, "coordinator: [ROAST] only %d remain — FAILED\n",
+            remaining);
+    g_signing_done = 1;
+  }
+
+  printf("coordinator: [ROAST] %d signers remain — re-issuing SIGN_REQ\n",
+         remaining);
+  broadcast_sign_req(list);
+}
+
+/*  Called once per select() timeout to retire sessions that have been
+ *  waiting longer than ROAST_SESSION_TIMEOUT_SEC for shares.
+ */
+static void roast_expire_sessions(struct signerlist *list) {
+  time_t now = time(NULL);
+  for (int i = 0; i < ROAST_MAX_SESSIONS; i++) {
+    struct roast_session *s = &g_sessions[i];
+    if (s->state != RSESS_AWAITING_SHARES)
+      continue;
+    if (now < s->deadline)
+      continue;
+
+    fprintf(stderr, "coordinator: [ROAST] session %u timed out\n", s->id);
+    s->state = RSESS_FAILED;
+
+    /* ── Classify session members ───────────────────────────────
+     * A signer "cooperated" if share_lens[slot] > 0 — they sent
+     * a share before the deadline.  Silent signers get a strike.
+     * After FROST_MAX_STRIKES strikes they are blacklisted and
+     * excluded from all future sessions.                        */
+    int n_coop = 0;
+    int n_silent = 0;
+    for (int si = 0; si < s->n_signers; si++) {
+      int cooperated = (s->share_lens[si] > 0);
+      printf("coordinator: [ROAST] session %u — signer %u %s\n", s->id,
+             s->signer_ids[si],
+             cooperated ? "cooperated (share received)"
+                        : "SILENT    (no share)");
+      if (cooperated)
+        n_coop++;
+      else
+        n_silent++;
+    }
+    printf("coordinator: [ROAST] cooperated=%d silent=%d\n", n_coop, n_silent);
+
+    /* ── Reset or penalise each session member ──────────────── */
+    struct signer *sg, *tmp;
+    for (int si = 0; si < s->n_signers; si++) {
+      int cooperated = (s->share_lens[si] > 0);
+
+      LIST_FOREACH_SAFE(sg, list, entries, tmp) {
+        if (sg->id != s->signer_ids[si])
+          continue;
+
+        if (cooperated) {
+          /* Proven reliable this round — reset cleanly */
+          sg->sign_phase = SPHASE_INIT;
+          sg->commit_len = 0;
+          sg->sig_share_len = 0;
+          sg->session_id = 0;
+          signer_send(sg, FROST_MSG_SIGN_REQ, g_tbs, g_tbs_len);
+          printf("coordinator: [ROAST] signer %u → INIT  "
+                 "(strikes=%d, reliable)\n",
+                 sg->id, get_strikes(sg->id));
+        } else {
+          /* Silent — issue a strike */
+          add_strike(sg->id);
+          int strikes = get_strikes(sg->id);
+          if (strikes >= FROST_MAX_STRIKES) {
+            blacklist_signer(sg->id);
+            sg->sign_phase = SPHASE_BLACKLISTED;
+            printf("coordinator: [ROAST] signer %u BLACKLISTED "
+                   "after %d strikes\n",
+                   sg->id, strikes);
+          } else {
+            /* Still eligible but deprioritised */
+            sg->sign_phase = SPHASE_SUSPECT;
+            sg->commit_len = 0;
+            sg->sig_share_len = 0;
+            sg->session_id = 0;
+            signer_send(sg, FROST_MSG_SIGN_REQ, g_tbs, g_tbs_len);
+            printf("coordinator: [ROAST] signer %u → SUSPECT "
+                   "(strike %d/%d)\n",
+                   sg->id, strikes, FROST_MAX_STRIKES);
+          }
+        }
+        break;
+      }
+    }
+
+    /* Try to form a new session from whoever is already committed.
+     * Reliable signers that committed before the timeout is detected
+     * are immediately eligible; re-issued SIGN_REQs produce more
+     * commits shortly.                                             */
+    if (!g_signing_done && roast_active_count() < ROAST_MAX_SESSIONS)
+      roast_try_form_session(list);
   }
 }
 
-/* Dispatch a fully-received frame from a registered signer. */
+/* ══════════════════════════════════════════════════════════════════
+ * Frame dispatch
+ * ══════════════════════════════════════════════════════════════════ */
+
 static void process_signer_frame(struct signerlist *list, struct signer *sg,
                                  frost_msg_t type, const uint8_t *payload,
                                  uint16_t plen) {
-
   switch (type) {
 
+    /* ── DKG messages ─────────────────────────────────────────── */
+
   case FROST_MSG_ROUND1_PKG:
-    if (g_dkg_state != DKG_COLLECTING_R1) {
-      fprintf(stderr, "coordinator: stray r1 from signer %u\n", sg->id);
+    if (g_dkg_state != DKG_COLLECTING_R1)
       return;
-    }
-    if (plen > FROST_MAX_PAYLOAD) {
-      fprintf(stderr, "coordinator: r1 too large\n");
+    if (plen > FROST_MAX_PAYLOAD)
       return;
-    }
     memcpy(sg->r1_pkg, payload, plen);
     sg->r1_len = plen;
     printf("coordinator: r1 from signer %u (%u bytes)\n", sg->id, plen);
@@ -1015,81 +1176,703 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
     break;
 
   case FROST_MSG_ROUND2_PKG: {
-    /* payload: [uint16_t target_id][pkg_bytes...] */
-    if (plen < 4) {
-      fprintf(stderr, "coordinator: r2 too short\n");
+    if (plen < 4)
       return;
-    }
     uint16_t target = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
-    printf("coordinator: r2 from signer %u → signer %u (%u bytes)\n", sg->id,
-           target, (unsigned)(plen - 4));
+    printf("coordinator: r2 %u→%u (%u bytes)\n", sg->id, target, plen - 4);
     relay_r2_to_target(list, target, payload, plen);
     break;
   }
 
-  case FROST_MSG_COMMIT:
-    if (g_dkg_state != DKG_SIGNING) {
-      fprintf(stderr, "coordinator: stray commit from signer %u\n", sg->id);
-      return;
-    }
-    if (plen > FROST_MAX_PAYLOAD) {
-      fprintf(stderr, "coordinator: commit too large\n");
-      return;
-    }
-    memcpy(sg->commit, payload, plen);
-    sg->commit_len = plen;
-    printf("coordinator: commit from signer %u (%u bytes)\n", sg->id, plen);
-    check_commits_complete(list, g_tbs, g_tbs_len);
-    break;
-
-  case FROST_MSG_SIG_SHARE:
-    if (plen > FROST_MAX_PAYLOAD)
-      return;
-    memcpy(sg->sig_share, payload, plen);
-    sg->sig_share_len = plen;
-    printf("coordinator: sig share from signer %u (%u bytes)\n", sg->id, plen);
-    maybe_aggregate(list);
-    break;
-
-  case FROST_MSG_SIGN_REQ:
-    /* A signer acting as signing initiator can push a TBS blob */
-    if (plen > FROST_MAX_PAYLOAD) {
-      fprintf(stderr, "coordinator: TBS too large\n");
-      return;
-    }
-    memcpy(g_tbs, payload, plen);
-    g_tbs_len = plen;
-    maybe_broadcast_signing_pkg(list, g_tbs, g_tbs_len);
-    break;
-
-  case FROST_MSG_R2_COMPLETE: {
-    if (sg->r2_complete) {
-      fprintf(stderr, "coordinator: duplicate R2_COMPLETE from signer %u\n",
-              sg->id);
+  case FROST_MSG_R2_COMPLETE:
+    if (sg->r2_complete)
       break;
-    }
     sg->r2_complete = 1;
     printf("coordinator: R2_COMPLETE from signer %u\n", sg->id);
     check_r2_complete(list);
     break;
+
+  case FROST_MSG_REFRESH_R1:
+    if (g_mode != COORD_MODE_REFRESH || g_dkg_state != DKG_COLLECTING_R1)
+      return;
+    if (plen > FROST_MAX_PAYLOAD)
+      return;
+    memcpy(sg->r1_pkg, payload, plen);
+    sg->r1_len = plen;
+    printf("coordinator: [REFRESH] r1 from signer %u (%u bytes)\n", sg->id,
+           plen);
+    check_refresh_r1_complete(list);
+    break;
+
+  case FROST_MSG_REFRESH_R2: {
+    if (g_mode != COORD_MODE_REFRESH)
+      return;
+    if (plen < 4)
+      return;
+    uint16_t target = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
+    printf("coordinator: [REFRESH] r2 %u→%u (%u bytes)\n", sg->id, target,
+           plen - 4);
+    /* route using RELAY_REFRESH_R2 */
+    struct signer *tsg, *ttmp;
+    LIST_FOREACH_SAFE(tsg, list, entries, ttmp)
+    if (tsg->id == target) {
+      signer_send(tsg, FROST_MSG_RELAY_REFRESH_R2, payload, plen);
+      break;
+    }
+    break;
   }
+
+  case FROST_MSG_REFRESH_R2_COMPLETE:
+    if (g_mode != COORD_MODE_REFRESH || sg->r2_complete)
+      break;
+    sg->r2_complete = 1;
+    printf("coordinator: [REFRESH] R2_COMPLETE from signer %u\n", sg->id);
+    check_refresh_r2_complete(list);
+    break;
+
+  case FROST_MSG_REFRESH_COMPLETE:
+    /* Payload = new PublicKeyPackage hex bytes (raw, not hex-encoded again) */
+    if (g_pub_key_pkg_len == 0 && plen > 0) {
+      /* Save updated pub_key_pkg from the first signer that reports */
+      memcpy(g_pub_key_pkg, payload, plen);
+      g_pub_key_pkg_len = plen;
+      char hex[FROST_MAX_PAYLOAD * 2 + 2];
+      bytes_to_hex(g_pub_key_pkg, g_pub_key_pkg_len, hex);
+      FILE *fp = fopen(FROST_PUB_PKG_HEX, "w");
+      if (fp) {
+        fprintf(fp, "%s\n", hex);
+        fclose(fp);
+        printf("coordinator: [REFRESH] new pub_key_pkg.hex written\n");
+      }
+    }
+    g_refresh_complete_count++;
+    printf("coordinator: [REFRESH] signer %u confirmed new shares (%d/%u)\n",
+           sg->id, g_refresh_complete_count, g_n);
+    check_refresh_all_confirmed(list);
+    break;
 
   case FROST_MSG_PUB_KEY_PKG:
     if (g_pub_key_pkg_len > 0)
-      break; /* already have it, ignore duplicates */
-    if (plen > FROST_MAX_PAYLOAD) {
-      fprintf(stderr, "coordinator: pub key pkg too large\n");
+      break; /* keep first one received */
+    if (plen > FROST_MAX_PAYLOAD)
       return;
-    }
     memcpy(g_pub_key_pkg, payload, plen);
     g_pub_key_pkg_len = plen;
-    printf("coordinator: stored PublicKeyPackage from signer %u (%u bytes)\n",
-           sg->id, plen);
+    printf("coordinator: PublicKeyPackage stored (%u bytes)\n", plen);
+    /* Persist so sign mode can load without re-running DKG */
+    {
+      char hex[FROST_MAX_PAYLOAD * 2 + 2];
+      bytes_to_hex(g_pub_key_pkg, g_pub_key_pkg_len, hex);
+      FILE *fp = fopen(FROST_PUB_PKG_HEX, "w");
+      if (fp) {
+        fprintf(fp, "%s\n", hex);
+        fclose(fp);
+        printf("coordinator: wrote " FROST_PUB_PKG_HEX "\n");
+      }
+    }
     break;
 
+    /* ── Sign-mode messages ───────────────────────────────────── */
+
+  case FROST_MSG_SHARE_LOAD_FAIL:
+    printf(
+        "coordinator: signer %u has no key on disk — excluded from signing\n",
+        sg->id);
+    sg->sign_phase = SPHASE_NO_KEY;
+    break;
+
+  case FROST_MSG_COMMIT:
+    if (g_mode != COORD_MODE_SIGN)
+      break;
+    if (sg->sign_phase != SPHASE_INIT &&
+        sg->sign_phase != SPHASE_SUSPECT) { /* ← add SUSPECT here */
+      fprintf(stderr, "coordinator: stray commit from signer %u (phase %d)\n",
+              sg->id, (int)sg->sign_phase);
+      break;
+    }
+
+    if (plen > FROST_MAX_PAYLOAD)
+      return;
+    memcpy(sg->commit, payload, plen);
+    sg->commit_len = plen;
+    sg->sign_phase = SPHASE_COMMITTED;
+    printf("coordinator: [ROAST] commit from signer %u (%u bytes)\n", sg->id,
+           plen);
+
+    /* Try to form a session whenever a new commit lands */
+    if (!g_signing_done && roast_active_count() < ROAST_MAX_SESSIONS)
+      roast_try_form_session(list);
+    break;
+
+  case FROST_MSG_SIG_SHARE: {
+    if (g_mode != COORD_MODE_SIGN)
+      break;
+    if (plen > FROST_MAX_PAYLOAD)
+      return;
+
+    struct roast_session *sess = roast_find(sg->session_id);
+    if (!sess || sess->state != RSESS_AWAITING_SHARES) {
+      fprintf(stderr,
+              "coordinator: share from signer %u — no matching session\n",
+              sg->id);
+      break;
+    }
+    int slot = roast_signer_slot(sess, sg->id);
+    if (slot < 0) {
+      fprintf(stderr, "coordinator: share from signer %u not in session %u\n",
+              sg->id, sess->id);
+      break;
+    }
+    memcpy(sess->shares[slot], payload, plen);
+    sess->share_lens[slot] = plen;
+    sess->n_shares++;
+    sg->sign_phase = SPHASE_SHARED;
+    printf("coordinator: [ROAST] share from signer %u → session %u (%d/%u)\n",
+           sg->id, sess->id, sess->n_shares, g_t);
+
+    if (sess->n_shares >= (int)g_t)
+      roast_try_aggregate(list, sess);
+    break;
+  }
+
   default:
-    fprintf(stderr, "coordinator: unknown msg type 0x%02x from signer %u\n",
+    fprintf(stderr, "coordinator: unknown msg 0x%02x from signer %u\n",
             (unsigned)type, sg->id);
     break;
   }
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * main()
+ * ══════════════════════════════════════════════════════════════════ */
+
+static void usage(const char *prog) {
+  fprintf(stderr,
+          "Usage:\n"
+          "  DKG mode:  %s dkg [--n <n>] [--t <t>]\n"
+          "  Sign mode: %s sign --user-key <file> --principal <name>\n"
+          "             [--n <n>] [--t <t>] [--serial <n>]\n"
+          "             [--validity <secs>] [--output <file>]\n",
+          prog, prog);
+}
+
+static int b64_char_val(char c) {
+  if (c >= 'A' && c <= 'Z')
+    return c - 'A';
+  if (c >= 'a' && c <= 'z')
+    return c - 'a' + 26;
+  if (c >= '0' && c <= '9')
+    return c - '0' + 52;
+  if (c == '+')
+    return 62;
+  if (c == '/')
+    return 63;
+  return 0;
+}
+
+static int b64_decode(const char *in, uint8_t *out, size_t max) {
+  size_t ilen = strlen(in);
+  while (ilen > 0 && (in[ilen - 1] == '=' || in[ilen - 1] == '\n'))
+    ilen--;
+  size_t j = 0;
+  for (size_t i = 0; i + 3 < ilen + 3; i += 4) {
+    int a = i < ilen ? b64_char_val(in[i]) : 0;
+    int b = i + 1 < ilen ? b64_char_val(in[i + 1]) : 0;
+    int c = i + 2 < ilen ? b64_char_val(in[i + 2]) : 0;
+    int d = i + 3 < ilen ? b64_char_val(in[i + 3]) : 0;
+    if (j >= max)
+      return -1;
+    out[j++] = (uint8_t)((a << 2) | (b >> 4));
+    if (i + 2 < ilen && j < max)
+      out[j++] = (uint8_t)(((b & 15) << 4) | (c >> 2));
+    if (i + 3 < ilen && j < max)
+      out[j++] = (uint8_t)(((c & 3) << 6) | d);
+  }
+  return (int)j;
+}
+
+int main(int argc, char **argv) {
+  if (argc < 2) {
+    usage(argv[0]);
+    return EXIT_FAILURE;
+  }
+
+  /* Mode */
+  if (strcmp(argv[1], "dkg") == 0)
+    g_mode = COORD_MODE_DKG;
+  else if (strcmp(argv[1], "sign") == 0)
+    g_mode = COORD_MODE_SIGN;
+  else if (strcmp(argv[1], "refresh") == 0)
+    g_mode = COORD_MODE_REFRESH;
+  else {
+    fprintf(stderr, "coordinator: unknown mode '%s'\n", argv[1]);
+    usage(argv[0]);
+    return EXIT_FAILURE;
+  }
+
+  /* Options */
+  for (int i = 2; i < argc; i++) {
+    if (!strcmp(argv[i], "--n") && i + 1 < argc) {
+      sscanf(argv[++i], "%hu", &g_n);
+    } else if (!strcmp(argv[i], "--t") && i + 1 < argc) {
+      sscanf(argv[++i], "%hu", &g_t);
+    } else if (!strcmp(argv[i], "--user-key") && i + 1 < argc) {
+      strncpy(g_user_key_file, argv[++i], 255);
+    } else if (!strcmp(argv[i], "--principal") && i + 1 < argc) {
+      strncpy(g_principal, argv[++i], 127);
+    } else if (!strcmp(argv[i], "--output") && i + 1 < argc) {
+      strncpy(g_output_file, argv[++i], 255);
+    } else if (!strcmp(argv[i], "--serial") && i + 1 < argc) {
+      g_serial = (uint64_t)atol(argv[++i]);
+    } else if (!strcmp(argv[i], "--validity") && i + 1 < argc) {
+      g_validity_secs = (uint64_t)atol(argv[++i]);
+    } else {
+      fprintf(stderr, "coordinator: unknown option '%s'\n", argv[i]);
+      return EXIT_FAILURE;
+    }
+  }
+
+  /* Validate sign-mode parameters */
+  if (g_mode == COORD_MODE_SIGN) {
+    if (strlen(g_principal) == 0) {
+      fprintf(stderr, "coordinator: --principal required in sign mode\n");
+      return EXIT_FAILURE;
+    }
+
+    /* Load PublicKeyPackage from disk (written by a previous DKG session) */
+    if (access(FROST_PUB_PKG_HEX, R_OK) != 0) {
+      fprintf(stderr, "coordinator: %s not found — run DKG mode first\n",
+              FROST_PUB_PKG_HEX);
+      return EXIT_FAILURE;
+    }
+    {
+      char hex[FROST_MAX_PAYLOAD * 2 + 4];
+      FILE *fp = fopen(FROST_PUB_PKG_HEX, "r");
+      if (!fp) {
+        perror(FROST_PUB_PKG_HEX);
+        return EXIT_FAILURE;
+      }
+      if (!fgets(hex, sizeof(hex), fp)) {
+        fprintf(stderr, "coordinator: %s is empty\n", FROST_PUB_PKG_HEX);
+        fclose(fp);
+        return EXIT_FAILURE;
+      }
+      fclose(fp);
+      int plen = hex_to_bytes(hex, g_pub_key_pkg, FROST_MAX_PAYLOAD);
+      if (plen <= 0) {
+        fprintf(stderr, "coordinator: failed to decode %s\n",
+                FROST_PUB_PKG_HEX);
+        return EXIT_FAILURE;
+      }
+      g_pub_key_pkg_len = (uint16_t)plen;
+      printf("coordinator: PublicKeyPackage loaded (%u bytes)\n",
+             g_pub_key_pkg_len);
+    }
+
+    /* Generate TBS and dummy cert template via Rust binary */
+    uint64_t now = (uint64_t)time(NULL);
+    if (call_tbs(now, now + g_validity_secs) != 0) {
+      fprintf(stderr, "coordinator: TBS generation failed\n");
+      return EXIT_FAILURE;
+    }
+
+    /* ── Patch the TBS: replace ephemeral CA key with real FROST CA key ── *
+     * The ssh_key library embeds SigningKey::public_key() in the TBS as    *
+     * the certificate's signature_key field.  In cmd_tbs this is an        *
+     * ephemeral key (so Builder::sign validation passes).  The last 32     *
+     * bytes of the TBS are the raw Ed25519 key bytes of that field.        *
+     * Replace them with the real FROST aggregate verifying key so FROST    *
+     * signs TBS bytes that will match what cmd_mint rebuilds.              */
+    {
+      if (g_tbs_len < 32) {
+        fprintf(stderr, "coordinator: TBS too short to patch (%u bytes)\n",
+                g_tbs_len);
+        return EXIT_FAILURE;
+      }
+
+      /* Get FROST CA verifying key (32 raw bytes) via pubkey subcommand */
+      char pub_hex[FROST_MAX_PAYLOAD * 2 + 4];
+      bytes_to_hex(g_pub_key_pkg, g_pub_key_pkg_len, pub_hex);
+
+      char pkmd_in[FROST_MAX_PAYLOAD * 2 + 8];
+      int pkmd_n = snprintf(pkmd_in, sizeof(pkmd_in), "%s\n", pub_hex);
+      char pkmd_tmp[] = "/tmp/frost_pkmd_XXXXXX";
+      int pkmd_fd = mkstemp(pkmd_tmp);
+      if (pkmd_fd < 0) {
+        perror("mkstemp pkmd");
+        return EXIT_FAILURE;
+      }
+      write(pkmd_fd, pkmd_in, (size_t)pkmd_n);
+      close(pkmd_fd);
+
+      char pkmd_cmd[256];
+      snprintf(pkmd_cmd, sizeof(pkmd_cmd), FROST_CORE_BIN " pubkey < %s",
+               pkmd_tmp);
+      FILE *pkfp = popen(pkmd_cmd, "r");
+      if (!pkfp) {
+        perror("popen pubkey");
+        unlink(pkmd_tmp);
+        return EXIT_FAILURE;
+      }
+
+      char pk_line[512];
+      if (!fgets(pk_line, sizeof(pk_line), pkfp)) {
+        fprintf(stderr, "coordinator: pubkey produced no output\n");
+        pclose(pkfp);
+        unlink(pkmd_tmp);
+        return EXIT_FAILURE;
+      }
+      pclose(pkfp);
+      unlink(pkmd_tmp);
+      pk_line[strcspn(pk_line, "\r\n")] = '\0';
+
+      /* Parse "ssh-ed25519 <base64> frost-ca" → 32-byte raw key */
+      char *sp1 = strchr(pk_line, ' ');
+      if (!sp1) {
+        fprintf(stderr, "coordinator: bad pubkey output\n");
+        return EXIT_FAILURE;
+      }
+      char *b64 = sp1 + 1;
+      char *sp2 = strchr(b64, ' ');
+      if (sp2)
+        *sp2 = '\0';
+
+      uint8_t wire[256];
+      int wlen = b64_decode(b64, wire, sizeof(wire));
+      if (wlen < 4 + 11 + 4 + 32) {
+        fprintf(stderr, "coordinator: pubkey decode too short (%d)\n", wlen);
+        return EXIT_FAILURE;
+      }
+      /* wire = [uint32=11]["ssh-ed25519"][uint32=32][32 bytes] */
+      uint8_t *frost_ca_key32 = wire + 4 + 11 + 4;
+
+      /* Patch: overwrite the last 32 bytes of TBS */
+      memcpy(g_tbs + g_tbs_len - 32, frost_ca_key32, 32);
+      /* Refresh the hex string the coordinator passes to mint */
+      bytes_to_hex(g_tbs, g_tbs_len, g_tbs_hex);
+      printf("coordinator: TBS patched with FROST CA key\n");
+    }
+
+    /* Initialise ROAST state */
+    memset(g_sessions, 0, sizeof(g_sessions));
+    memset(g_blacklist, 0, sizeof(g_blacklist));
+  }
+
+  if (g_mode == COORD_MODE_REFRESH) {
+    /* Load current pub_key_pkg so we can verify it is unchanged after refresh
+     */
+    if (access(FROST_PUB_PKG_HEX, R_OK) != 0) {
+      fprintf(stderr, "coordinator: %s not found — run DKG first\n",
+              FROST_PUB_PKG_HEX);
+      return EXIT_FAILURE;
+    }
+    char hex[FROST_MAX_PAYLOAD * 2 + 4];
+    FILE *fp = fopen(FROST_PUB_PKG_HEX, "r");
+    if (fp && fgets(hex, sizeof(hex), fp)) {
+      int plen = hex_to_bytes(hex, g_pub_key_pkg, FROST_MAX_PAYLOAD);
+      if (plen > 0)
+        g_pub_key_pkg_len = (uint16_t)plen;
+      fclose(fp);
+    }
+    /* Clear it so the post-refresh write from REFRESH_COMPLETE is accepted */
+    g_pub_key_pkg_len = 0;
+    printf("coordinator: [REFRESH] old pub_key_pkg verified — waiting for "
+           "signers\n");
+  }
+
+  printf("coordinator: mode = %s\n", g_mode == COORD_MODE_DKG ? "DKG" : "SIGN");
+
+  /* GnuTLS */
+  gnutls_certificate_credentials_t x509_cred;
+  gnutls_global_init();
+  gnutls_certificate_allocate_credentials(&x509_cred);
+  gnutls_certificate_set_x509_trust_file(x509_cred, FROST_CAFILE,
+                                         GNUTLS_X509_FMT_PEM);
+  if (gnutls_certificate_set_x509_key_file(x509_cred, FROST_COORD_CERT,
+                                           FROST_COORD_KEY,
+                                           GNUTLS_X509_FMT_PEM) < 0) {
+    fprintf(stderr, "coordinator: failed to load cert/key\n");
+    return EXIT_FAILURE;
+  }
+
+  /* Listen socket */
+  int listenfd;
+  struct sockaddr_in serv_addr;
+  if ((listenfd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
+    perror("socket");
+    return EXIT_FAILURE;
+  }
+  int yes = 1;
+  setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  memset(&serv_addr, 0, sizeof(serv_addr));
+  serv_addr.sin_family = AF_INET;
+  serv_addr.sin_addr.s_addr = inet_addr(FROST_COORD_HOST);
+  serv_addr.sin_port = htons(FROST_COORD_PORT);
+  if (bind(listenfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+    perror("bind");
+    close(listenfd);
+    return EXIT_FAILURE;
+  }
+  listen(listenfd, FROST_MAX_SIGNERS + 4);
+  printf("coordinator: listening on %s:%d\n", FROST_COORD_HOST,
+         FROST_COORD_PORT);
+
+  /* Peer lists */
+  struct signerlist signers;
+  struct stagedlist staged;
+  LIST_INIT(&signers);
+  LIST_INIT(&staged);
+
+  /* Event loop */
+  for (;;) {
+    /* In sign mode, exit once signing is complete and all queues flushed */
+    if (g_signing_done && g_mode == COORD_MODE_SIGN) {
+      int all_quiet = 1;
+      struct signer *sg, *tmp;
+      LIST_FOREACH_SAFE(sg, &signers, entries, tmp)
+      if (!TAILQ_EMPTY(&sg->msgq)) {
+        all_quiet = 0;
+        break;
+      }
+      if (all_quiet)
+        break;
+    }
+
+    fd_set readset, writeset;
+    int max_fd;
+    FD_ZERO(&readset);
+    FD_ZERO(&writeset);
+    FD_SET(listenfd, &readset);
+    max_fd = listenfd;
+
+    struct signer *sg, *tmp_sg;
+    LIST_FOREACH_SAFE(sg, &signers, entries, tmp_sg) {
+      if (sg->want_write || !TAILQ_EMPTY(&sg->msgq))
+        FD_SET(sg->sockfd, &writeset);
+      else
+        FD_SET(sg->sockfd, &readset);
+      if (sg->sockfd > max_fd)
+        max_fd = sg->sockfd;
+    }
+    struct staged_conn *st, *tmp_st;
+    LIST_FOREACH_SAFE(st, &staged, entries, tmp_st) {
+      if (st->want_write || !TAILQ_EMPTY(&st->msgq))
+        FD_SET(st->sockfd, &writeset);
+      else
+        FD_SET(st->sockfd, &readset);
+      if (st->sockfd > max_fd)
+        max_fd = st->sockfd;
+    }
+
+    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    int sel = select(max_fd + 1, &readset, &writeset, NULL, &tv);
+    if (sel < 0) {
+      if (errno == EINTR)
+        continue;
+      perror("select");
+      break;
+    }
+
+    /* Periodic: expire timed-out ROAST sessions */
+    if (g_mode == COORD_MODE_SIGN && !g_signing_done)
+      roast_expire_sessions(&signers);
+
+    if (sel == 0)
+      continue;
+
+    /* Accept new connection */
+    if (FD_ISSET(listenfd, &readset)) {
+      struct sockaddr_in cli;
+      socklen_t clilen = sizeof(cli);
+      int newsock = accept(listenfd, (struct sockaddr *)&cli, &clilen);
+      if (newsock < 0) {
+        perror("accept");
+        goto accept_done;
+      }
+      if (fcntl(newsock, F_SETFL, O_NONBLOCK) < 0) {
+        perror("fcntl");
+        close(newsock);
+        goto accept_done;
+      }
+      gnutls_session_t sess;
+      gnutls_init(&sess, GNUTLS_SERVER);
+      gnutls_credentials_set(sess, GNUTLS_CRD_CERTIFICATE, x509_cred);
+      gnutls_certificate_server_set_request(sess, GNUTLS_CERT_IGNORE);
+      gnutls_handshake_set_timeout(sess, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
+      gnutls_priority_set_direct(sess, "NORMAL", NULL);
+      gnutls_transport_set_int(sess, newsock);
+      int r = gnutls_handshake(sess);
+      if (r < 0) {
+        gnutls_deinit(sess);
+        close(newsock);
+        goto accept_done;
+      }
+      struct staged_conn *new_st = malloc(sizeof(*new_st));
+      if (!new_st) {
+        gnutls_deinit(sess);
+        close(newsock);
+        goto accept_done;
+      }
+      new_st->session = sess;
+      new_st->sockfd = newsock;
+      new_st->addr = cli;
+      new_st->inptr = new_st->inbuf;
+      new_st->want_write = 0;
+      TAILQ_INIT(&new_st->msgq);
+      LIST_INSERT_HEAD(&staged, new_st, entries);
+      printf("coordinator: staged connection from %s\n",
+             inet_ntoa(cli.sin_addr));
+    }
+  accept_done:;
+
+    /* Service staged connections */
+    LIST_FOREACH_SAFE(st, &staged, entries, tmp_st) {
+      if (FD_ISSET(st->sockfd, &writeset)) {
+        drain_staged_write(st, &staged);
+        continue;
+      }
+      if (!FD_ISSET(st->sockfd, &readset))
+        continue;
+
+      int r = gnutls_record_recv(st->session, st->inptr,
+                                 (st->inbuf + FROST_FRAME_MAX) - st->inptr);
+      if (r == GNUTLS_E_AGAIN || r == GNUTLS_E_INTERRUPTED) {
+        st->want_write = gnutls_record_get_direction(st->session);
+        continue;
+      }
+      if (r <= 0) {
+        remove_staged(&staged, st);
+        continue;
+      }
+      st->inptr += r;
+      if ((st->inptr - st->inbuf) < FROST_FRAME_HDR)
+        continue;
+      frost_msg_t msg_type;
+      uint16_t plen = frost_decode_header(st->inbuf, &msg_type);
+      if ((st->inptr - st->inbuf) < (int)(FROST_FRAME_HDR + plen))
+        continue;
+      st->inptr = st->inbuf;
+
+      if (msg_type != FROST_MSG_HELLO) {
+        remove_staged(&staged, st);
+        continue;
+      }
+
+      /* Parse HELLO: "SIGNER <n> <t>\n" */
+      char hellobuf[64];
+      uint16_t pn = 0, pt = 0;
+      size_t cp = plen < 63 ? plen : 63;
+      memcpy(hellobuf, st->inbuf + FROST_FRAME_HDR, cp);
+      hellobuf[cp] = '\0';
+      if (sscanf(hellobuf, "SIGNER %hu %hu", &pn, &pt) != 2 || pn < 2 ||
+          pt < 1 || pt > pn || pn > FROST_MAX_SIGNERS) {
+        const uint8_t *e = (const uint8_t *)"bad HELLO";
+        staged_send(st, FROST_MSG_ERROR, e, (uint16_t)strlen((char *)e));
+        continue;
+      }
+      if (g_n == 0) {
+        g_n = pn;
+        g_t = pt;
+      } else if (pn != g_n || pt != g_t) {
+        const uint8_t *e = (const uint8_t *)"n/t mismatch";
+        staged_send(st, FROST_MSG_ERROR, e, (uint16_t)strlen((char *)e));
+        continue;
+      }
+
+      /* Promote staged → signer */
+      struct signer *new_sg = malloc(sizeof(*new_sg));
+      if (!new_sg) {
+        remove_staged(&staged, st);
+        continue;
+      }
+      new_sg->session = st->session;
+      new_sg->sockfd = st->sockfd;
+      new_sg->addr = st->addr;
+      new_sg->id = g_next_id++;
+      new_sg->n = g_n;
+      new_sg->t = g_t;
+      new_sg->inptr = new_sg->inbuf;
+      new_sg->want_write = 0;
+      new_sg->r1_len = 0;
+      new_sg->r2_complete = 0;
+      new_sg->commit_len = 0;
+      new_sg->sig_share_len = 0;
+      new_sg->sign_phase = SPHASE_INIT;
+      new_sg->session_id = 0;
+      TAILQ_INIT(&new_sg->msgq);
+
+      /* Drain staged outbox (should be empty) */
+      {
+        struct outmsg *dm, *dtm;
+        TAILQ_FOREACH_SAFE(dm, &st->msgq, entries, dtm) {
+          TAILQ_REMOVE(&st->msgq, dm, entries);
+          free(dm->data);
+          free(dm);
+        }
+      }
+      LIST_REMOVE(st, entries);
+      free(st);
+      LIST_INSERT_HEAD(&signers, new_sg, entries);
+      printf("coordinator: signer %u registered (n=%u t=%u) from %s\n",
+             new_sg->id, g_n, g_t, inet_ntoa(new_sg->addr.sin_addr));
+
+      /* HELLO_ACK: include mode character so signer knows to load from disk */
+      char ackbuf[32];
+      int acklen = snprintf(ackbuf, sizeof(ackbuf), "ACK %u %c\n", new_sg->id,
+                            g_mode == COORD_MODE_DKG    ? 'D'
+                            : g_mode == COORD_MODE_SIGN ? 'S'
+                                                        : 'R');
+      signer_send(new_sg, FROST_MSG_HELLO_ACK, (uint8_t *)ackbuf,
+                  (uint16_t)acklen);
+
+      /* Mode-specific actions */
+      if (g_mode == COORD_MODE_DKG)
+        maybe_start_dkg(&signers);
+      else if (g_mode == COORD_MODE_REFRESH)
+        maybe_start_refresh(&signers);
+      else {
+        /* SIGN mode: send SIGN_REQ immediately.
+         * The signer processes HELLO_ACK first (sets its ID, loads key from
+         * disk), then processes SIGN_REQ in the next select iteration.     */
+        signer_send(new_sg, FROST_MSG_SIGN_REQ, g_tbs, g_tbs_len);
+        printf("coordinator: [ROAST] SIGN_REQ → signer %u\n", new_sg->id);
+      }
+    } /* staged loop */
+
+    /* Service registered signers */
+    LIST_FOREACH_SAFE(sg, &signers, entries, tmp_sg) {
+      if (FD_ISSET(sg->sockfd, &writeset)) {
+        drain_signer_write(sg, &signers);
+        continue;
+      }
+      if (!FD_ISSET(sg->sockfd, &readset))
+        continue;
+
+      int r = gnutls_record_recv(sg->session, sg->inptr,
+                                 (sg->inbuf + FROST_FRAME_MAX) - sg->inptr);
+      if (r == GNUTLS_E_AGAIN || r == GNUTLS_E_INTERRUPTED) {
+        sg->want_write = gnutls_record_get_direction(sg->session);
+        continue;
+      }
+      if (r <= 0) {
+        remove_signer(&signers, sg);
+        continue;
+      }
+      sg->inptr += r;
+      if ((sg->inptr - sg->inbuf) < FROST_FRAME_HDR)
+        continue;
+      frost_msg_t msg_type;
+      uint16_t plen = frost_decode_header(sg->inbuf, &msg_type);
+      if ((sg->inptr - sg->inbuf) < (int)(FROST_FRAME_HDR + plen))
+        continue;
+      sg->inptr = sg->inbuf;
+      process_signer_frame(&signers, sg, msg_type, sg->inbuf + FROST_FRAME_HDR,
+                           plen);
+    } /* signer loop */
+
+  } /* event loop */
+
+  gnutls_global_deinit();
+  close(listenfd);
+  return EXIT_SUCCESS;
 }

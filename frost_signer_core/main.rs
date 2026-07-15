@@ -41,6 +41,10 @@ use std::process;
 use frost_ed25519 as frost;
 use frost_ed25519::keys::dkg;
 
+use ed25519_dalek::SigningKey as DalekKey;
+
+use frost::keys::refresh as frost_refresh;
+
 // ── Hex helpers ──────────────────────────────────────────────────
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -72,7 +76,7 @@ fn base64_encode(input: &[u8]) -> String {
         let b0 = input[i] as usize;
         let b1 = if i+1 < input.len() { input[i+1] as usize } else { 0 };
         let b2 = if i+2 < input.len() { input[i+2] as usize } else { 0 };
-        out.push(CHARS[(b0 >> 2)] as char);
+        out.push(CHARS[b0 >> 2] as char);
         out.push(CHARS[((b0 & 3) << 4) | (b1 >> 4)] as char);
         out.push(if i+1 < input.len() { CHARS[((b1 & 0xf) << 2) | (b2 >> 6)] as char } else { '=' });
         out.push(if i+2 < input.len() { CHARS[b2 & 0x3f] as char } else { '=' });
@@ -111,17 +115,25 @@ use signature::Signer;
 use ssh_key::{SigningKey, public::KeyData, Signature as SshSignature, Algorithm};
 
 /* ── Pass 1: capture TBS ─────────────────────────────────────── */
+// The ephemeral keypair is used ONLY so Builder::sign() passes its
+// internal signature validation.  The dummy cert is discarded; only
+// the TBS bytes (what was passed to try_sign) matter.  The ephemeral
+// CA key embedded in those TBS bytes will be replaced by the coordinator
+// with the real FROST CA key before the bytes are sent to signers.
 struct TbsCapture {
-    pub_key: KeyData,
-    tbs: std::cell::RefCell<Vec<u8>>,
+    pub_key: KeyData,                       // ephemeral verifying key
+    tbs:     std::cell::RefCell<Vec<u8>>,
+    eph_key: ed25519_dalek::SigningKey,     // produces real dummy sig
 }
 
 impl Signer<SshSignature> for TbsCapture {
     fn try_sign(&self, msg: &[u8]) -> std::result::Result<SshSignature, signature::Error> {
         *self.tbs.borrow_mut() = msg.to_vec();
-        /* return a placeholder — the Certificate produced here is discarded */
-        Ok(SshSignature::new(Algorithm::Ed25519, vec![0u8; 64])
-            .map_err(|_| signature::Error::new())?)
+        // Sign with the ephemeral key so the cert passes library validation.
+        use ed25519_dalek::Signer as DalekSigner;
+        let sig = self.eph_key.sign(msg);
+        SshSignature::new(Algorithm::Ed25519, sig.to_bytes().to_vec())
+            .map_err(|_| signature::Error::new())
     }
 }
 
@@ -311,6 +323,187 @@ fn cmd_dkg_part3(n: u16) -> Result<(), String> {
     Ok(())
 }
 
+/// refresh_part1 — generate zero-polynomial round-1 package.
+///
+/// stdin:  (nothing; params come from --id --n --t flags)
+/// stdout: line 1  hex(round1::SecretPackage)
+///         line 2  hex(round1::Package)  → broadcast to all peers
+fn cmd_refresh_part1(id: u16, n: u16, t: u16) -> Result<(), String> {
+    let identifier = frost::Identifier::try_from(id)
+        .map_err(|e| format!("identifier: {:?}", e))?;
+
+    let (secret_package, round1_package) =
+        frost_refresh::refresh_dkg_part1(identifier, n, t, rand::thread_rng())
+            .map_err(|e| format!("refresh_part1: {:?}", e))?;
+
+    let secret_bytes = secret_package.serialize()
+        .map_err(|e| format!("secret serialize: {:?}", e))?;
+    let package_bytes = round1_package.serialize()
+        .map_err(|e| format!("package serialize: {:?}", e))?;
+
+    println!("{}", to_hex(&secret_bytes));
+    println!("{}", to_hex(&package_bytes));
+    Ok(())
+}
+
+/// refresh_part2 — compute unicast round-2 packages.
+///
+/// stdin:  line 1  hex(round1::SecretPackage from part1)
+///         lines 2..n  "<id> <hex(peer round1::Package)>"
+/// stdout: line 1  hex(round2::SecretPackage)
+///         lines 2..n  "<id> <hex(round2::Package)>"  (one per peer)
+fn cmd_refresh_part2(my_id: u16) -> Result<(), String> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+
+    let secret_hex = read_line(&mut input)?;
+    let secret_bytes = from_hex(secret_hex.trim())?;
+    let secret_package = frost::keys::dkg::round1::SecretPackage::deserialize(&secret_bytes)
+        .map_err(|e| format!("secret deserialize: {:?}", e))?;
+
+    let my_identifier = frost::Identifier::try_from(my_id)
+        .map_err(|e| format!("identifier: {:?}", e))?;
+
+    let mut round1_packages: std::collections::BTreeMap
+        <frost::Identifier, frost::keys::dkg::round1::Package> = Default::default();
+
+    loop {
+        let line = match read_line(&mut input) {
+            Ok(l) => l,
+            Err(_) => break,
+        };
+        let line = line.trim().to_string();
+        if line.is_empty() { break; }
+        let mut parts = line.splitn(2, ' ');
+        let id_str  = parts.next().ok_or("missing id")?;
+        let hex_str = parts.next().ok_or("missing hex")?;
+        let sender_id: u16 = id_str.parse()
+            .map_err(|_| format!("bad id: {}", id_str))?;
+        if frost::Identifier::try_from(sender_id)
+            .map(|i| i == my_identifier).unwrap_or(false) { continue; }
+        let ident = frost::Identifier::try_from(sender_id)
+            .map_err(|e| format!("identifier: {:?}", e))?;
+        let pkg_bytes = from_hex(hex_str.trim())?;
+        let pkg = frost::keys::dkg::round1::Package::deserialize(&pkg_bytes)
+            .map_err(|e| format!("r1 pkg deserialize: {:?}", e))?;
+        round1_packages.insert(ident, pkg);
+    }
+
+    let (secret_package2, round2_packages) =
+        frost_refresh::refresh_dkg_part2(secret_package, &round1_packages)
+            .map_err(|e| format!("refresh_part2: {:?}", e))?;
+
+    let secret2_bytes = secret_package2.serialize()
+        .map_err(|e| format!("secret2 serialize: {:?}", e))?;
+    println!("{}", to_hex(&secret2_bytes));
+
+    for (identifier, package) in &round2_packages {
+        let id_bytes = identifier.serialize();
+        let raw = u16::from_le_bytes([id_bytes[0], id_bytes[1]]);            
+        let pkg_bytes = package.serialize()
+            .map_err(|e| format!("r2 pkg serialize: {:?}", e))?;
+        println!("{} {}", raw, to_hex(&pkg_bytes));
+    }
+    Ok(())
+}
+
+/// refresh_shares — combine refresh shares with old key material.
+///
+/// stdin:  line 1      hex(round2::SecretPackage from part2)
+///         lines 2..n  "<id> <hex(peer round1::Package)>"
+///         lines n+1.. "<id> <hex(peer round2::Package)>"  (terminate with blank)
+///         next line   hex(old PublicKeyPackage)
+///         next line   hex(old KeyPackage)
+/// stdout: line 1  hex(new KeyPackage)        → overwrite shares/signer_N.keypkg
+///         line 2  hex(new PublicKeyPackage)  → overwrite pub_key_pkg.hex
+///
+/// Invariant verified: new PublicKeyPackage.verifying_key ==
+///                     old PublicKeyPackage.verifying_key
+fn cmd_refresh_shares(n: u16) -> Result<(), String> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+
+    /* round2 secret package */
+    let r2_secret_hex = read_line(&mut input)?;
+    let r2_secret_bytes = from_hex(r2_secret_hex.trim())?;
+    let round2_secret = frost::keys::dkg::round2::SecretPackage::deserialize(&r2_secret_bytes)
+        .map_err(|e| format!("r2 secret deserialize: {:?}", e))?;
+
+    /* peer round-1 packages  (n-1 of them) */
+    let mut round1_packages: std::collections::BTreeMap
+        <frost::Identifier, frost::keys::dkg::round1::Package> = Default::default();
+    for _ in 0..(n - 1) {
+        let line = read_line(&mut input)?;
+        let line = line.trim().to_string();
+        let mut parts = line.splitn(2, ' ');
+        let id_str  = parts.next().ok_or("missing r1 id")?;
+        let hex_str = parts.next().ok_or("missing r1 hex")?;
+        let sender_id: u16 = id_str.parse()
+            .map_err(|_| format!("bad r1 id: {}", id_str))?;
+        let ident = frost::Identifier::try_from(sender_id)
+            .map_err(|e| format!("r1 identifier: {:?}", e))?;
+        let pkg_bytes = from_hex(hex_str.trim())?;
+        let pkg = frost::keys::dkg::round1::Package::deserialize(&pkg_bytes)
+            .map_err(|e| format!("r1 pkg deserialize: {:?}", e))?;
+        round1_packages.insert(ident, pkg);
+    }
+
+    /* peer round-2 packages  (n-1 of them) */
+    let mut round2_packages: std::collections::BTreeMap
+        <frost::Identifier, frost::keys::dkg::round2::Package> = Default::default();
+    for _ in 0..(n - 1) {
+        let line = read_line(&mut input)?;
+        let line = line.trim().to_string();
+        let mut parts = line.splitn(2, ' ');
+        let id_str  = parts.next().ok_or("missing r2 id")?;
+        let hex_str = parts.next().ok_or("missing r2 hex")?;
+        let sender_id: u16 = id_str.parse()
+            .map_err(|_| format!("bad r2 id: {}", id_str))?;
+        let ident = frost::Identifier::try_from(sender_id)
+            .map_err(|e| format!("r2 identifier: {:?}", e))?;
+        let pkg_bytes = from_hex(hex_str.trim())?;
+        let pkg = frost::keys::dkg::round2::Package::deserialize(&pkg_bytes)
+            .map_err(|e| format!("r2 pkg deserialize: {:?}", e))?;
+        round2_packages.insert(ident, pkg);
+    }
+
+    /* old PublicKeyPackage */
+    let old_pub_hex = read_line(&mut input)?;
+    let old_pub_bytes = from_hex(old_pub_hex.trim())?;
+    let old_pub_key_package = frost::keys::PublicKeyPackage::deserialize(&old_pub_bytes)
+        .map_err(|e| format!("old pub deserialize: {:?}", e))?;
+
+    /* old KeyPackage */
+    let old_key_hex = read_line(&mut input)?;
+    let old_key_bytes = from_hex(old_key_hex.trim())?;
+    let old_key_package = frost::keys::KeyPackage::deserialize(&old_key_bytes)
+        .map_err(|e| format!("old key deserialize: {:?}", e))?;
+
+    /* Perform the refresh */
+    let (new_key_package, new_pub_key_package) =
+        frost_refresh::refresh_dkg_shares(
+            &round2_secret,
+            &round1_packages,
+            &round2_packages,
+            old_pub_key_package.clone(),
+            old_key_package,
+        ).map_err(|e| format!("refresh_shares: {:?}", e))?;
+
+    /* Verify the group key is unchanged — fundamental refresh invariant */
+    if new_pub_key_package.verifying_key() != old_pub_key_package.verifying_key() {
+        return Err("INVARIANT VIOLATED: verifying key changed after refresh".to_string());
+    }
+
+    let new_key_bytes = new_key_package.serialize()
+        .map_err(|e| format!("new key serialize: {:?}", e))?;
+    let new_pub_bytes = new_pub_key_package.serialize()
+        .map_err(|e| format!("new pub serialize: {:?}", e))?;
+
+    println!("{}", to_hex(&new_key_bytes));
+    println!("{}", to_hex(&new_pub_bytes));
+    Ok(())
+}
+
 /// commit --id <u16>
 ///
 /// stdin:  line 1 — hex(KeyPackage)
@@ -387,6 +580,66 @@ fn cmd_aggregate(t: u16) -> Result<(), String> {
     let stdin = io::stdin();
     let mut input = stdin.lock();
 
+    let spkg_hex  = read_line(&mut input)?;
+    let spkg_bytes = from_hex(spkg_hex.trim())?;
+    let signing_package = frost::SigningPackage::deserialize(&spkg_bytes)
+        .map_err(|e| format!("signing package: {:?}", e))?;
+
+    let pkg_hex   = read_line(&mut input)?;
+    let pkg_bytes = from_hex(pkg_hex.trim())?;
+    let pub_key_package = frost::keys::PublicKeyPackage::deserialize(&pkg_bytes)
+        .map_err(|e| format!("pub key package: {:?}", e))?;
+
+    let mut signature_shares: std::collections::BTreeMap<frost::Identifier, frost::round2::SignatureShare> = Default::default();
+
+    /* ── NEW: track identifier → signer_id for culprit lookup ── */
+    let mut id_to_signer: std::collections::BTreeMap<frost::Identifier, u16> =
+        Default::default();
+
+    for _ in 0..t {
+        let line  = read_line(&mut input)?;
+        let line  = line.trim();
+        let mut parts = line.splitn(2, ' ');
+        let id_str  = parts.next().ok_or("missing signer id")?;
+        let hex_str = parts.next().ok_or("missing commitment hex")?;
+        let signer_id: u16 = id_str.parse()
+            .map_err(|_| format!("bad signer id: {}", id_str))?;
+        let ident = frost::Identifier::try_from(signer_id)
+            .map_err(|e| format!("identifier: {:?}", e))?;
+        let share_bytes = from_hex(hex_str.trim())?;
+        let share = frost::round2::SignatureShare::deserialize(&share_bytes)
+            .map_err(|e| format!("share deserialize: {:?}", e))?;
+
+        id_to_signer.insert(ident, signer_id);     /* ← NEW */
+        signature_shares.insert(ident, share);
+    }
+
+    /* ── Aggregate with specific culprit reporting ────────────── */
+    match frost::aggregate(&signing_package, &signature_shares, &pub_key_package) {
+        Ok(sig) => {
+            let bytes = sig.serialize()
+                .map_err(|e| format!("sig serialize: {:?}", e))?;
+            println!("{}", to_hex(&bytes));   /* use existing helper, not hex::encode */
+            Ok(())
+        }
+        /* ── NEW: identifiable abort ──────────────────────────── */
+        Err(frost::Error::InvalidSignatureShare { culprits }) => {
+            if let Some(culprit) = culprits.iter().next() {
+                if let Some(&sid) = id_to_signer.get(culprit) {
+                    println!("CULPRIT:{}", sid);
+                }
+            }
+            Err(format!("invalid share from culprits: {:?}", culprits))
+        }
+        Err(e) => Err(format!("aggregate: {:?}", e)),
+    }
+}
+
+/*
+fn cmd_aggregate(t: u16) -> Result<(), String> {
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+
     let signing_bytes = read_hex_blob(&mut input)?;
     let pub_key_bytes = read_hex_blob(&mut input)?;
 
@@ -426,6 +679,7 @@ fn cmd_aggregate(t: u16) -> Result<(), String> {
     writeln!(out, "{}", to_hex(&sig_bytes)).map_err(|e| e.to_string())?;
     Ok(())
 }
+*/
 
 /// pubkey
 ///
@@ -581,9 +835,26 @@ fn cmd_tbs() -> Result<(), String> {
     builder.cert_type(CertType::User).map_err(|e| format!("cert_type: {}", e))?;
     builder.valid_principal(principal.trim()).map_err(|e| format!("principal: {}", e))?;
 
-    let capture = TbsCapture {
-        pub_key: pubkey.key_data().clone(),
-        tbs: std::cell::RefCell::new(Vec::new()),
+    // Add standard user certificate extensions (sorted lexicographically as required)
+builder.extension("permit-agent-forwarding", "")
+    .map_err(|e| format!("ext: {}", e))?;
+builder.extension("permit-port-forwarding", "")
+    .map_err(|e| format!("ext: {}", e))?;
+builder.extension("permit-pty", "")
+    .map_err(|e| format!("ext: {}", e))?;
+builder.extension("permit-user-rc", "")
+    .map_err(|e| format!("ext: {}", e))?;
+
+    // Generate a real ephemeral keypair so Builder::sign() passes validation.
+    // The coordinator will replace the ephemeral CA key bytes in the TBS with
+    // the real FROST CA key before sending to signers.
+    let eph_key  = DalekKey::generate(&mut rand::thread_rng());
+    let eph_vk   = eph_key.verifying_key();
+    let eph_pub  = ssh_key::public::Ed25519PublicKey(eph_vk.to_bytes());
+    let capture  = TbsCapture {
+        pub_key:  KeyData::Ed25519(eph_pub),
+        tbs:      std::cell::RefCell::new(Vec::new()),
+        eph_key,
     };
 
     /* sign() calls try_sign() which captures TBS into capture.tbs */
@@ -606,51 +877,88 @@ fn cmd_tbs() -> Result<(), String> {
 ///
 /// stdin:  line 1 — OpenSSH cert string from tbs (with dummy sig)
 ///         line 2 — hex(64-byte FROST signature from aggregate)
-///         line 3 — hex(TBS bytes, same as fed to SIGN — for verification)
-/// stdout: OpenSSH certificate with real signature
+///         line 3 — hex(TBS bytes, same as fed to SIGN)
+///         line 4 — hex(PublicKeyPackage)  ← CA key source
+/// stdout: valid OpenSSH certificate
 fn cmd_mint() -> Result<(), String> {
     use ssh_key::Certificate;
 
     let stdin = io::stdin();
     let mut input = stdin.lock();
 
-    let cert_str  = read_line(&mut input)?;
-    let sig_hex   = read_line(&mut input)?;
-    let tbs_hex   = read_line(&mut input)?;
+    let cert_str    = read_line(&mut input)?;
+    let sig_hex     = read_line(&mut input)?;
+    let _tbs_hex    = read_line(&mut input)?;   // consumed but not used
+    let pub_pkg_hex = read_line(&mut input)?;   // NEW: PublicKeyPackage
 
     let sig_bytes = from_hex(sig_hex.trim())?;
-    let tbs_bytes = from_hex(tbs_hex.trim())?;
 
-    /* parse the dummy cert to extract all fields */
+    // Derive the FROST CA public key from the PublicKeyPackage.
+    let pkg_bytes   = from_hex(pub_pkg_hex.trim())?;
+    let pub_key_pkg = frost::keys::PublicKeyPackage::deserialize(&pkg_bytes)
+        .map_err(|e| format!("PublicKeyPackage deserialize in mint: {:?}", e))?;
+    let vk_bytes    = pub_key_pkg.verifying_key()
+        .serialize()
+        .map_err(|e| format!("VerifyingKey serialize in mint: {:?}", e))?;
+    let ca_key_data = KeyData::Ed25519(
+        ssh_key::public::Ed25519PublicKey(
+            vk_bytes.try_into().map_err(|_| "VerifyingKey not 32 bytes".to_string())?
+        )
+    );
+
+    // Parse the dummy cert to extract stable fields (nonce, subject key, etc.)
     let dummy_cert: Certificate = cert_str.trim().parse()
         .map_err(|e| format!("parse cert: {}", e))?;
 
-    /* rebuild with real signature using the same fields */
-    let nonce     = dummy_cert.nonce().to_vec();
-    let pub_key   = dummy_cert.public_key().clone();
+    let nonce        = dummy_cert.nonce().to_vec();
+    let subject_key  = dummy_cert.public_key().clone();   // user's key (subject)
     let valid_after  = dummy_cert.valid_after();
     let valid_before = dummy_cert.valid_before();
 
     let mut builder = ssh_key::certificate::Builder::new(
             nonce,
-            pub_key.clone(),
+            subject_key,
             valid_after,
             valid_before,
-        )
-        .map_err(|e| format!("builder: {}", e))?;
+        ).map_err(|e| format!("builder: {}", e))?;
 
-    builder.serial(dummy_cert.serial()).map_err(|e| format!("serial: {}", e))?;
-    builder.key_id(dummy_cert.key_id()).map_err(|e| format!("key_id: {}", e))?;
-    builder.cert_type(dummy_cert.cert_type()).map_err(|e| format!("cert_type: {}", e))?;
+    builder.serial(dummy_cert.serial())
+        .map_err(|e| format!("serial: {}", e))?;
+    builder.key_id(dummy_cert.key_id())
+        .map_err(|e| format!("key_id: {}", e))?;
+    builder.cert_type(dummy_cert.cert_type())
+        .map_err(|e| format!("cert_type: {}", e))?;
     for p in dummy_cert.valid_principals() {
-        builder.valid_principal(p).map_err(|e| format!("principal: {}", e))?;
+        builder.valid_principal(p)
+            .map_err(|e| format!("principal: {}", e))?;
     }
-let comment = dummy_cert.comment();
-if !comment.is_empty() {
-    builder.comment(comment).map_err(|e| format!("comment: {}", e))?;
-}
-    let inject = FrostInject { pub_key, sig_bytes };
-    let cert = builder.sign(&inject)
+// ── ADD THESE TWO LOOPS ───────────────────────────────────────────
+// Extensions and critical options must be copied so the TBS bytes
+// Builder constructs here are byte-for-byte identical to the TBS
+// bytes that FROST signed.  Any difference causes signature verification
+// to fail inside Builder::sign().
+    for (name, data) in dummy_cert.extensions().iter() {
+    builder.extension(name, data)
+        .map_err(|e| format!("ext: {}", e))?;
+    }
+    for (name, data) in dummy_cert.critical_options().iter() {
+    builder.critical_option(name, data)
+        .map_err(|e| format!("critical_option: {}", e))?;
+    }
+    // ─────────────────────────────────────────────────────────────────
+    
+
+
+    let comment = dummy_cert.comment();
+    if !comment.is_empty() {
+        builder.comment(comment)
+            .map_err(|e| format!("comment: {}", e))?;
+    }
+
+    // FrostInject.public_key() → FROST CA key (embeds correctly in cert).
+    // try_sign() ignores the message and injects the pre-computed signature.
+    let inject = FrostInject { pub_key: ca_key_data, sig_bytes };
+    let cert   = builder.sign(&inject)
         .map_err(|e| format!("sign inject: {}", e))?;
 
     println!("{}", cert.to_openssh()
@@ -706,6 +1014,26 @@ fn main() {
             let n = require_u16(&args, "--n");
             match n {
                 Ok(n) => cmd_dkg_part3(n),
+                Err(e) => Err(e),
+            }
+        }
+        "refresh_part1" => {
+            match (require_u16(&args, "--id"),
+                   require_u16(&args, "--n"),
+                   require_u16(&args, "--t")) {
+                (Ok(id), Ok(n), Ok(t)) => cmd_refresh_part1(id, n, t),
+                (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => Err(e),
+            }
+        }
+        "refresh_part2" => {
+            match require_u16(&args, "--id") {
+                Ok(id) => cmd_refresh_part2(id),
+                Err(e) => Err(e),
+            }
+        }
+        "refresh_shares" => {
+            match require_u16(&args, "--n") {
+                Ok(n) => cmd_refresh_shares(n),
                 Err(e) => Err(e),
             }
         }
