@@ -34,17 +34,14 @@ OUTPUT   ?= user_key-cert.pub
         sign sign-coord sign-signer1 sign-signer2 \
         verify clean clean-shares help
 
-all: frost_coordinator frost_signer_1 frost_signer_2
+all: frost_coordinator frost_signer
 
 # ── Binaries ─────────────────────────────────────────────────────
 
 frost_coordinator: frost_coordinator.c frost_common.h frost_stubs.c
 	$(CC) $(CFLAGS) $(FROST_DEF) -o $@ frost_coordinator.c $(LDFLAGS)
 
-frost_signer_1: frost_signer.c frost_common.h frost_stubs.c
-	$(CC) $(CFLAGS) $(FROST_DEF) -o $@ frost_signer.c $(LDFLAGS)
-
-frost_signer_2: frost_signer.c frost_common.h frost_stubs.c
+frost_signer: frost_signer.c frost_common.h frost_stubs.c
 	$(CC) $(CFLAGS) $(FROST_DEF) -o $@ frost_signer.c $(LDFLAGS)
 
 # ── DKG mode ─────────────────────────────────────────────────────
@@ -54,11 +51,8 @@ dkg-coord:
 	mkdir -p shares
 	./frost_coordinator dkg --n $(N) --t $(T)
 
-dkg-signer1: frost_signer_1
-	./frost_signer_1 certs/beocat.crt certs/beocatkey.pem $(N) $(T)
-
-dkg-signer2: frost_signer_2
-	./frost_signer_2 certs/football.crt certs/footballkey.pem $(N) $(T)
+dkg-signer: frost_signer
+	./frost_signer certs/beocat.crt certs/beocatkey.pem $(N) $(T)
 
 # Convenience: all three in background (requires job control)
 dkg: all
@@ -66,8 +60,7 @@ dkg: all
 	@mkdir -p shares
 	@./frost_coordinator dkg --n $(N) --t $(T) &
 	@sleep 0.4
-	@./frost_signer_1 certs/beocat.crt   certs/beocatkey.pem   $(N) $(T) &
-	@./frost_signer_2 certs/football.crt certs/footballkey.pem $(N) $(T) &
+	@./frost_signer certs/beocat.crt certs/beocatkey.pem $(N) $(T) &
 	@wait
 	@echo "DKG complete -- key shares in ./shares/"
 
@@ -84,11 +77,8 @@ sign-coord:
 	    --validity  $(VALIDITY) \
 	    --output    $(OUTPUT)
 
-sign-signer1: frost_signer_1
-	./frost_signer_1 certs/beocat.crt certs/beocatkey.pem $(N) $(T)
-
-sign-signer2: frost_signer_2
-	./frost_signer_2 certs/football.crt certs/footballkey.pem $(N) $(T)
+sign-signer: frost_signer
+	./frost_signer certs/football.crt certs/footballkey.pem $(N) $(T)
 
 # Convenience: all three in background
 sign: all
@@ -101,8 +91,7 @@ sign: all
 	    --n $(N) --t $(T) --serial $(SERIAL) \
 	    --validity $(VALIDITY) --output $(OUTPUT) &
 	@sleep 0.4
-	@./frost_signer_1 certs/beocat.crt   certs/beocatkey.pem   $(N) $(T) &
-	@./frost_signer_2 certs/football.crt certs/footballkey.pem $(N) $(T) &
+	@./frost_signer certs/beocat.crt   certs/beocatkey.pem   $(N) $(T) &
 	@wait
 	@echo "Done -- certificate at $(OUTPUT)"
 
@@ -112,7 +101,7 @@ verify:
 
 # ── Cleanup ──────────────────────────────────────────────────────
 clean:
-	rm -f frost_coordinator frost_signer_1 frost_signer_2
+	rm -f frost_coordinator frost_signer	
 	rm -f pub_key_pkg.hex frost_ca_signer_*.pub signature_pkg.hex
 	rm -f $(OUTPUT)
 

@@ -752,24 +752,20 @@ static int roast_try_form_session(struct signerlist *list) {
   if (n_chosen < (int)g_t)
     return 0;
 
+  int r = 0;
+  for (int ci = 0; ci < n_chosen; ci++)
+    if (get_strikes(chosen[ci]) == 0)
+      r++;
+  int s2 = 0;
+  for (int ci = 0; ci < n_chosen; ci++)
+    if (get_strikes(chosen[ci]) > 0)
+      s2++;
+
   printf("coordinator: [ROAST] session %u selection — "
          "reliable=%d suspect=%d\n",
          g_next_session_id,
          /* count how many of the chosen have zero strikes */
-         ({
-           int r = 0;
-           for (int ci = 0; ci < n_chosen; ci++)
-             if (get_strikes(chosen[ci]) == 0)
-               r++;
-           r;
-         }),
-         ({
-           int s2 = 0;
-           for (int ci = 0; ci < n_chosen; ci++)
-             if (get_strikes(chosen[ci]) > 0)
-               s2++;
-           s2;
-         }));
+         (r), (s2));
 
   /* Build stdin for frost_signer_core assemble:
    *   line 1: hex(TBS)
@@ -1180,6 +1176,9 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
       return;
     uint16_t target = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
     printf("coordinator: r2 %u→%u (%u bytes)\n", sg->id, target, plen - 4);
+    printf("[%s:%d] hex = ", __FILE__, __LINE__);
+    print_bytes_as_hex(payload, plen);
+
     relay_r2_to_target(list, target, payload, plen);
     break;
   }
@@ -1212,6 +1211,8 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
     uint16_t target = (uint16_t)(((uint16_t)payload[2] << 8) | payload[3]);
     printf("coordinator: [REFRESH] r2 %u→%u (%u bytes)\n", sg->id, target,
            plen - 4);
+    printf("[%s:%d] hex = ", __FILE__, __LINE__);
+    print_bytes_as_hex(payload, plen);
     /* route using RELAY_REFRESH_R2 */
     struct signer *tsg, *ttmp;
     LIST_FOREACH_SAFE(tsg, list, entries, ttmp)

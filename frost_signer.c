@@ -111,6 +111,8 @@ static uint8_t g_inbuf[FROST_FRAME_MAX];
 static uint8_t *g_inptr;
 static int g_want_write = 0;
 
+gnutls_privkey_t my_priv;
+
 TAILQ_HEAD(outq_head, outmsg) g_outq;
 
 typedef enum {
@@ -273,13 +275,22 @@ static int connect_to_coordinator(gnutls_certificate_credentials_t cred) {
   gnutls_credentials_set(g_coord_sess, GNUTLS_CRD_CERTIFICATE, cred);
   gnutls_handshake_set_timeout(g_coord_sess, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
   gnutls_priority_set_direct(g_coord_sess, "NORMAL", NULL);
-  gnutls_session_set_verify_cert(g_coord_sess, "localhost", 0);
+  gnutls_session_set_verify_cert(g_coord_sess, "coordinator", 0);
   gnutls_transport_set_int(g_coord_sess, sockfd);
 
   int r = 0;
   LOOP_CHECK(r, gnutls_handshake(g_coord_sess));
   if (r < 0) {
-    fprintf(stderr, "signer: TLS handshake: %s\n", gnutls_strerror(r));
+    if (r == GNUTLS_E_CERTIFICATE_VERIFICATION_ERROR) {
+      gnutls_datum_t out;
+      unsigned status = gnutls_session_get_verify_cert_status(g_coord_sess);
+      gnutls_certificate_verification_status_print(status, GNUTLS_CRT_X509,
+                                                   &out, 0);
+      fprintf(stderr, "signer: cert verify failure: %s\n", out.data);
+      gnutls_free(out.data);
+    } else {
+      fprintf(stderr, "signer: TLS handshake: %s\n", gnutls_strerror(r));
+    }
     close(sockfd);
     gnutls_deinit(g_coord_sess);
     return -1;
@@ -396,13 +407,54 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     /* Send each peer its unicast round-2 package:
      * payload = [src_id_hi][src_id_lo][dst_id_hi][dst_id_lo][pkg bytes] */
     for (int i = 0; i < g_peer_r1_count; i++) {
+
+      gnutls_pubkey_t pub = get_signer_pubkey(r2_ids[i]);
+      if (!pub) {
+        fprintf(stderr, "signer %u: no pubkey for signer %u, skipping\n",
+                g_my_id, r2_ids[i]);
+        continue;
+      }
+
+      /* Encrypt just the payload (r2_out[i], r2_lens[i] bytes -- always 37) */
+      gnutls_datum_t plaintext = {.data = r2_out[i], .size = r2_lens[i]};
+      gnutls_datum_t ciphertext;
+
+      int rc = gnutls_pubkey_encrypt_data(pub, 0, &plaintext, &ciphertext);
+      if (rc < 0) {
+        fprintf(stderr, "signer %u: RSA encrypt to %u failed: %s\n", g_my_id,
+                r2_ids[i], gnutls_strerror(rc));
+        continue;
+      }
+
+      /* ciphertext.size will be exactly the RSA modulus size (256 bytes
+       * for a 2048-bit key), regardless of the 37-byte input */
+
+      if (ciphertext.size > 256) {
+        fprintf(stderr, "signer %u: ciphertext too large (%u bytes)\n", g_my_id,
+                ciphertext.size);
+        gnutls_free(ciphertext.data);
+        continue;
+      }
+
       uint8_t frame[FROST_MAX_PAYLOAD + 4];
       frame[0] = (uint8_t)(g_my_id >> 8);
       frame[1] = (uint8_t)(g_my_id & 0xFF);
       frame[2] = (uint8_t)(r2_ids[i] >> 8);
       frame[3] = (uint8_t)(r2_ids[i] & 0xFF);
-      memcpy(frame + 4, r2_out[i], r2_lens[i]);
-      queue_to_coord(FROST_MSG_ROUND2_PKG, frame, (uint16_t)(r2_lens[i] + 4));
+      // memcpy(frame + 4, r2_out[i], r2_lens[i]);
+      memcpy(frame + 4, ciphertext.data, ciphertext.size);
+      // queue_to_coord(FROST_MSG_ROUND2_PKG, frame, (uint16_t)(r2_lens[i] +
+      // 4));
+      queue_to_coord(FROST_MSG_ROUND2_PKG, frame,
+                     (uint16_t)(4 + ciphertext.size));
+
+      gnutls_free(ciphertext.data);
+      // printf("r2_lens[%d] = %u\n", i, r2_lens[i]);
+      printf("signer %u: plaintext to be encrypted (%u bytes)\n", g_my_id,
+             plaintext.size);
+      print_bytes_as_hex(plaintext.data, plaintext.size);
+      printf("ciphertext.size = %u\n", ciphertext.size);
+      print_bytes_as_hex(frame, 254 + 4);
       printf("signer %u: sent ROUND2_PKG → %u\n", g_my_id, r2_ids[i]);
     }
     break;
@@ -420,9 +472,32 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     if (g_peer_r2_count >= FROST_MAX_SIGNERS)
       return;
     int idx = g_peer_r2_count++;
+
+    gnutls_datum_t ciphertext = {.data = (unsigned char *)(payload + 4),
+                                 .size = pkg_len - 4};
+    gnutls_datum_t plaintext;
+
+    int rc = gnutls_privkey_decrypt_data(my_priv, 0, &ciphertext, &plaintext);
+    if (rc < 0) {
+      fprintf(stderr, "signer %u: decrypt failed: %s\n", g_my_id,
+              gnutls_strerror(rc));
+      // gnutls_privkey_deinit(my_priv);
+      return;
+    }
+    // gnutls_privkey_deinit(my_priv);
+
+    /* plaintext.data / plaintext.size is your original 37-byte payload */
+    memcpy(g_peer_r2[idx], plaintext.data,
+           plaintext.size); /* or wherever it needs to go */
+
+    printf("signer %u: decryption found (%u bytes)\n", g_my_id, plaintext.size);
+    print_bytes_as_hex(plaintext.data, plaintext.size);
+
+    gnutls_free(plaintext.data);
+
     g_peer_r2_ids[idx] = sender_id;
-    g_peer_r2_len[idx] = pkg_len;
-    memcpy(g_peer_r2[idx], payload + 4, pkg_len);
+    g_peer_r2_len[idx] = plaintext.size; // pkg_len;
+    // memcpy(g_peer_r2[idx], payload + 4, pkg_len);
     printf("signer %u: r2 from %u (%u bytes) [%d/%u]\n", g_my_id, sender_id,
            pkg_len, g_peer_r2_count, (unsigned)(g_n - 1));
 
@@ -456,7 +531,7 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     /* Write the CA public key in OpenSSH format for human inspection.
      * Every signer produces the same aggregate public key, so all
      * frost_ca_signer_*.pub files are identical.                       */
-    {
+    if (0) {
       char pub_hex[FROST_MAX_PAYLOAD * 2 + 4];
       bytes_to_hex(g_pub_key_pkg, g_pub_key_pkg_len, pub_hex);
       char cmd[FROST_MAX_PAYLOAD * 3];
@@ -563,6 +638,7 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
       frame[3] = (uint8_t)(r2_ids[i] & 0xFF);
       memcpy(frame + 4, r2_out[i], r2_lens[i]);
       queue_to_coord(FROST_MSG_REFRESH_R2, frame, (uint16_t)(r2_lens[i] + 4));
+      printf("r2_ids[%d] = %u\n", i, r2_lens[i]);
       printf("signer %u: [REFRESH] sent R2 → %u\n", g_my_id, r2_ids[i]);
     }
     uint8_t notice[2] = {(uint8_t)(g_my_id >> 8), (uint8_t)(g_my_id & 0xFF)};
@@ -825,9 +901,17 @@ int main(int argc, char **argv) {
     }
   }
 
+  gnutls_global_init();
+
+  if (init_signer_pubkey_cache() != 0) {
+    fprintf(stderr,
+            "signer: one or more signer certs failed to load — aborting\n");
+    return EXIT_FAILURE;
+  }
+
   /* GnuTLS setup */
   gnutls_certificate_credentials_t x509_cred;
-  gnutls_global_init();
+  // gnutls_global_init();
   gnutls_certificate_allocate_credentials(&x509_cred);
   gnutls_certificate_set_x509_trust_file(x509_cred, FROST_CAFILE,
                                          GNUTLS_X509_FMT_PEM);
@@ -836,6 +920,15 @@ int main(int argc, char **argv) {
     fprintf(stderr, "signer: failed to load '%s' / '%s'\n", certfile, keyfile);
     return EXIT_FAILURE;
   }
+
+  /* Extract tls private key for routed payload decryption */
+  gnutls_privkey_init(&my_priv);
+
+  gnutls_datum_t key_data;
+  gnutls_load_file(keyfile, &key_data); /* e.g. certs/signer{g_my_id}key.pem */
+  gnutls_privkey_import_x509_raw(my_priv, &key_data, GNUTLS_X509_FMT_PEM, NULL,
+                                 0);
+  gnutls_free(key_data.data);
 
   g_coord_sock = connect_to_coordinator(x509_cred);
   if (g_coord_sock < 0)
