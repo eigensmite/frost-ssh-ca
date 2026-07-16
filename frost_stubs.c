@@ -823,3 +823,86 @@ static gnutls_pubkey_t get_signer_pubkey(uint16_t id) {
   }
   return g_pubkey_cache[id];
 }
+
+/* Cryptographically verify that `cert_file` (the --cert argument the
+ * user passed on the command line) holds the SAME public key as the
+ * cached certs/signer<id>.crt — i.e. that the identity this process is
+ * about to assert as <id> really is backed by that keypair, and not
+ * merely a coincidentally-present file at the expected path.
+ *
+ * Compares DER encodings of the two SubjectPublicKeyInfo structures
+ * rather than e.g. comparing raw cert bytes, so it still matches even
+ * if the two certs differ in serial number, validity window, or any
+ * other field — only the key material itself has to agree.
+ *
+ * Must be called after init_signer_pubkey_cache() has populated
+ * g_pubkey_cache[id]. Returns 0 on match, -1 on any mismatch or error
+ * (a diagnostic is printed in every failure case).                   */
+static int verify_own_identity(uint16_t id, const char *cert_file) {
+  gnutls_datum_t cert_data;
+  if (gnutls_load_file(cert_file, &cert_data) != GNUTLS_E_SUCCESS) {
+    fprintf(stderr, "signer: failed to load '%s' for identity check\n",
+            cert_file);
+    return -1;
+  }
+
+  gnutls_x509_crt_t cert;
+  gnutls_x509_crt_init(&cert);
+  if (gnutls_x509_crt_import(cert, &cert_data, GNUTLS_X509_FMT_PEM) !=
+      GNUTLS_E_SUCCESS) {
+    fprintf(stderr, "signer: failed to parse '%s' for identity check\n",
+            cert_file);
+    gnutls_free(cert_data.data);
+    gnutls_x509_crt_deinit(cert);
+    return -1;
+  }
+  gnutls_free(cert_data.data);
+
+  gnutls_pubkey_t supplied_pub;
+  gnutls_pubkey_init(&supplied_pub);
+  if (gnutls_pubkey_import_x509(supplied_pub, cert, 0) != GNUTLS_E_SUCCESS) {
+    fprintf(stderr, "signer: failed to extract pubkey from '%s'\n",
+            cert_file);
+    gnutls_x509_crt_deinit(cert);
+    gnutls_pubkey_deinit(supplied_pub);
+    return -1;
+  }
+  gnutls_x509_crt_deinit(cert);
+
+  /* Borrowed handle — owned by g_pubkey_cache, do not deinit it here. */
+  gnutls_pubkey_t expected_pub = get_signer_pubkey(id);
+  if (!expected_pub) {
+    gnutls_pubkey_deinit(supplied_pub);
+    return -1; /* get_signer_pubkey() already printed a diagnostic */
+  }
+
+  gnutls_datum_t supplied_der = {0};
+  gnutls_datum_t expected_der = {0};
+  int rc = -1;
+
+  if (gnutls_pubkey_export2(supplied_pub, GNUTLS_X509_FMT_DER,
+                            &supplied_der) != GNUTLS_E_SUCCESS ||
+      gnutls_pubkey_export2(expected_pub, GNUTLS_X509_FMT_DER,
+                            &expected_der) != GNUTLS_E_SUCCESS) {
+    fprintf(stderr,
+            "signer: failed to export a public key for comparison\n");
+    goto out;
+  }
+
+  if (supplied_der.size == expected_der.size &&
+      memcmp(supplied_der.data, expected_der.data, supplied_der.size) == 0) {
+    rc = 0;
+  } else {
+    fprintf(stderr,
+            "signer: public key in '%s' does NOT match "
+            "certs/signer%u.crt — refusing to assert id %u with a "
+            "mismatched identity\n",
+            cert_file, id, id);
+  }
+
+out:
+  gnutls_free(supplied_der.data);
+  gnutls_free(expected_der.data);
+  gnutls_pubkey_deinit(supplied_pub);
+  return rc;
+}

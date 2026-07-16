@@ -112,7 +112,6 @@ static coord_mode_t g_mode = COORD_MODE_DKG;
 static dkg_state_t g_dkg_state = DKG_IDLE;
 static uint16_t g_n = 0;
 static uint16_t g_t = 0;
-static uint16_t g_next_id = 1;
 
 /* PublicKeyPackage — needed by coordinator for aggregate calls */
 static uint8_t g_pub_key_pkg[FROST_MAX_PAYLOAD];
@@ -1759,14 +1758,20 @@ int main(int argc, char **argv) {
         continue;
       }
 
-      /* Parse HELLO: "SIGNER <n> <t>\n" */
+      /* Parse HELLO: "SIGNER <id> <n> <t>\n"
+       * The client asserts which signer identity it intends to hold —
+       * this MUST match the numeric suffix of the cert/key pair it
+       * loaded (certs/signer<id>.crt / certs/signer<id>key.pem), since
+       * that's the same naming scheme peers use to look up its public
+       * key when encrypting DKG round-2 packages to it.              */
       char hellobuf[64];
-      uint16_t pn = 0, pt = 0;
+      uint16_t pid = 0, pn = 0, pt = 0;
       size_t cp = plen < 63 ? plen : 63;
       memcpy(hellobuf, st->inbuf + FROST_FRAME_HDR, cp);
       hellobuf[cp] = '\0';
-      if (sscanf(hellobuf, "SIGNER %hu %hu", &pn, &pt) != 2 || pn < 2 ||
-          pt < 1 || pt > pn || pn > FROST_MAX_SIGNERS) {
+      if (sscanf(hellobuf, "SIGNER %hu %hu %hu", &pid, &pn, &pt) != 3 ||
+          pid < 1 || pid > FROST_MAX_SIGNERS || pn < 2 || pt < 1 ||
+          pt > pn || pn > FROST_MAX_SIGNERS || pid > pn) {
         const uint8_t *e = (const uint8_t *)"bad HELLO";
         staged_send(st, FROST_MSG_ERROR, e, (uint16_t)strlen((char *)e));
         continue;
@@ -1780,6 +1785,33 @@ int main(int argc, char **argv) {
         continue;
       }
 
+      /* Reject if another already-registered signer holds this ID.
+       * This is what actually prevents the connection-order race: two
+       * signers can never end up sharing (or swapping) an identity —
+       * whichever one asks for an ID second, if it's taken, is turned
+       * away instead of silently overwriting the mapping.            */
+      {
+        int id_taken = 0;
+        struct signer *existing, *etmp;
+        LIST_FOREACH_SAFE(existing, &signers, entries, etmp) {
+          if (existing->id == pid) {
+            id_taken = 1;
+            break;
+          }
+        }
+        if (id_taken) {
+          char ebuf[64];
+          int elen = snprintf(ebuf, sizeof(ebuf),
+                              "ID %u already registered", pid);
+          fprintf(stderr,
+                  "coordinator: signer requested ID %u — already taken, "
+                  "rejecting\n",
+                  pid);
+          staged_send(st, FROST_MSG_ERROR, (uint8_t *)ebuf, (uint16_t)elen);
+          continue;
+        }
+      }
+
       /* Promote staged → signer */
       struct signer *new_sg = malloc(sizeof(*new_sg));
       if (!new_sg) {
@@ -1789,7 +1821,7 @@ int main(int argc, char **argv) {
       new_sg->session = st->session;
       new_sg->sockfd = st->sockfd;
       new_sg->addr = st->addr;
-      new_sg->id = g_next_id++;
+      new_sg->id = pid;
       new_sg->n = g_n;
       new_sg->t = g_t;
       new_sg->inptr = new_sg->inbuf;

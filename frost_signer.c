@@ -24,7 +24,17 @@
  *   ciphertext] envelope and derive the key with PBKDF2.  The rest of
  *   this file is unchanged.
  *
- * Usage: ./frost_signer <cert_file> <key_file> <n> <t>
+ * Usage: ./frost_signer <cert_file> <key_file> <id> <n> <t> [--fault <type>]
+ *
+ * <id> is the identity this signer asserts to the coordinator (1..n).
+ * It must match the numeric suffix of the cert/key pair on disk at
+ * certs/signer<id>.crt / certs/signer<id>key.pem — that's the same
+ * naming scheme every signer uses to look up peers' public keys when
+ * encrypting DKG round-2 packages, so it must line up with whichever
+ * private key this process actually holds. The signer verifies those
+ * files exist before connecting, then sends <id> to the coordinator in
+ * HELLO. The coordinator accepts it only if no other connected signer
+ * already holds that ID; otherwise it rejects and this process exits.
  */
 
 #define _GNU_SOURCE
@@ -54,6 +64,7 @@
  * ══════════════════════════════════════════════════════════════════ */
 
 static uint16_t g_my_id = 0;
+static int g_id_confirmed = 0; /* set once coordinator ACKs our asserted ID */
 static uint16_t g_n = 0;
 static uint16_t g_t = 0;
 static dkg_state_t g_state = DKG_IDLE;
@@ -316,10 +327,24 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     char buf[32] = {0};
     memcpy(buf, payload, plen < 31 ? plen : 31);
     char mode_char = 'D';
-    if (sscanf(buf, "ACK %hu %c", &g_my_id, &mode_char) < 1) {
+    uint16_t acked_id = 0;
+    if (sscanf(buf, "ACK %hu %c", &acked_id, &mode_char) < 1) {
       fprintf(stderr, "signer: malformed HELLO_ACK: '%s'\n", buf);
       return;
     }
+    if (acked_id != g_my_id) {
+      /* Should never happen — the coordinator is supposed to echo back
+       * exactly the ID we asserted in HELLO. Treat a mismatch as fatal
+       * rather than silently adopting whatever ID it sent, since that
+       * would reintroduce the exact identity confusion this scheme is
+       * meant to prevent.                                             */
+      fprintf(stderr,
+              "signer %u: coordinator ACKed ID %u instead of requested "
+              "%u — aborting\n",
+              g_my_id, acked_id, g_my_id);
+      exit(EXIT_FAILURE);
+    }
+    g_id_confirmed = 1;
     g_coord_mode = (mode_char == 'S')   ? COORD_MODE_SIGN
                    : (mode_char == 'R') ? COORD_MODE_REFRESH
                                         : COORD_MODE_DKG;
@@ -474,7 +499,7 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     int idx = g_peer_r2_count++;
 
     gnutls_datum_t ciphertext = {.data = (unsigned char *)(payload + 4),
-                                 .size = pkg_len - 4};
+                                 .size = pkg_len};
     gnutls_datum_t plaintext;
 
     int rc = gnutls_privkey_decrypt_data(my_priv, 0, &ciphertext, &plaintext);
@@ -631,14 +656,52 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     /* Send each unicast r2 package:
      * [src_hi][src_lo][dst_hi][dst_lo][pkg bytes] */
     for (int i = 0; i < g_ref_peer_r1_count; i++) {
+
+      gnutls_pubkey_t pub = get_signer_pubkey(r2_ids[i]);
+      if (!pub) {
+        fprintf(stderr, "signer %u: no pubkey for signer %u, skipping\n",
+                g_my_id, r2_ids[i]);
+        continue;
+      }
+
+      gnutls_datum_t plaintext = {.data = r2_out[i], .size = r2_lens[i]};
+      gnutls_datum_t ciphertext;
+
+      int rc = gnutls_pubkey_encrypt_data(pub, 0, &plaintext, &ciphertext);
+      if (rc < 0) {
+        fprintf(stderr, "signer %u: RSA encrypt to %u failed: %s\n", g_my_id,
+                r2_ids[i], gnutls_strerror(rc));
+        continue;
+      }
+      /* ciphertext.size will be exactly the RSA modulus size (256 bytes
+       * for a 2048-bit key), regardless of the 37-byte input */
+
+      if (ciphertext.size > 256) {
+        fprintf(stderr, "signer %u: ciphertext too large (%u bytes)\n", g_my_id,
+                ciphertext.size);
+        gnutls_free(ciphertext.data);
+        continue;
+      }
+
       uint8_t frame[FROST_MAX_PAYLOAD + 4];
       frame[0] = (uint8_t)(g_my_id >> 8);
       frame[1] = (uint8_t)(g_my_id & 0xFF);
       frame[2] = (uint8_t)(r2_ids[i] >> 8);
       frame[3] = (uint8_t)(r2_ids[i] & 0xFF);
-      memcpy(frame + 4, r2_out[i], r2_lens[i]);
-      queue_to_coord(FROST_MSG_REFRESH_R2, frame, (uint16_t)(r2_lens[i] + 4));
-      printf("r2_ids[%d] = %u\n", i, r2_lens[i]);
+      // memcpy(frame + 4, r2_out[i], r2_lens[i]);
+      memcpy(frame + 4, ciphertext.data, ciphertext.size);
+      // queue_to_coord(FROST_MSG_REFRESH_R2, frame, (uint16_t)(r2_lens[i] +
+      // 4));
+      queue_to_coord(FROST_MSG_REFRESH_R2, frame,
+                     (uint16_t)(ciphertext.size + 4));
+      gnutls_free(ciphertext.data);
+      printf("signer %u: plaintext to be encrypted (%u bytes)\n", g_my_id,
+             plaintext.size);
+      print_bytes_as_hex(plaintext.data, plaintext.size);
+      printf("ciphertext.size = %u\n", ciphertext.size);
+      print_bytes_as_hex(frame, 254 + 4);
+
+      // printf("r2_ids[%d] = %u\n", i, r2_lens[i]);
       printf("signer %u: [REFRESH] sent R2 → %u\n", g_my_id, r2_ids[i]);
     }
     uint8_t notice[2] = {(uint8_t)(g_my_id >> 8), (uint8_t)(g_my_id & 0xFF)};
@@ -656,11 +719,37 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     if (g_ref_peer_r2_count >= FROST_MAX_SIGNERS)
       return;
     int idx = g_ref_peer_r2_count++;
+
+    gnutls_datum_t ciphertext = {.data = (unsigned char *)(payload + 4),
+                                 .size = pkg_len};
+    gnutls_datum_t plaintext;
+
+    int rc = gnutls_privkey_decrypt_data(my_priv, 0, &ciphertext, &plaintext);
+    if (rc < 0) {
+      fprintf(stderr, "signer %u: decrypt failed: %s\n", g_my_id,
+              gnutls_strerror(rc));
+      // gnutls_privkey_deinit(my_priv);
+      return;
+    }
+    // gnutls_privkey_deinit(my_priv);
+
+    /* plaintext.data / plaintext.size is your original 37-byte payload */
+    memcpy(g_ref_peer_r2[idx], plaintext.data,
+           plaintext.size); /* or wherever it needs to go */
+
+    printf("signer %u: decryption found (%u bytes)\n", g_my_id, plaintext.size);
+    print_bytes_as_hex(plaintext.data, plaintext.size);
+
+    gnutls_free(plaintext.data);
+
     g_ref_peer_r2_ids[idx] = sender_id;
-    g_ref_peer_r2_len[idx] = pkg_len;
-    memcpy(g_ref_peer_r2[idx], payload + 4, pkg_len);
+    g_ref_peer_r2_len[idx] = plaintext.size;
+    // memcpy(g_ref_peer_r2[idx], payload + 4, pkg_len);
     printf("signer %u: [REFRESH] r2 from %u [%d/%u]\n", g_my_id, sender_id,
            g_ref_peer_r2_count, (unsigned)(g_n - 1));
+
+    print_bytes_as_hex(g_ref_peer_r2[idx], g_ref_peer_r2_len[idx]);
+
     break;
   }
 
@@ -850,6 +939,13 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     char errbuf[256] = {0};
     memcpy(errbuf, payload, plen < 255 ? plen : 255);
     fprintf(stderr, "signer %u: coordinator error: %s\n", g_my_id, errbuf);
+    if (!g_id_confirmed) {
+      /* Most likely our asserted ID was rejected (already taken by
+       * another connected signer) or the HELLO itself was malformed.
+       * There's no valid session to continue in either case.        */
+      fprintf(stderr, "signer: coordinator rejected registration — exiting\n");
+      exit(EXIT_FAILURE);
+    }
     break;
   }
 
@@ -864,24 +960,72 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
  * ══════════════════════════════════════════════════════════════════ */
 
 int main(int argc, char **argv) {
-  if (argc < 5) {
+  if (argc < 4) {
     fprintf(stderr,
-            "Usage: %s <cert_file> <key_file> <n> <t> [--fault <type>]\n",
+            "Usage: %s <id> <n> <t> "
+            "[--fault <type>]\n",
             argv[0]);
     return EXIT_FAILURE;
   }
-  const char *certfile = argv[1], *keyfile = argv[2];
-  if (sscanf(argv[3], "%hu", &g_n) != 1 || g_n < 2 || g_n > FROST_MAX_SIGNERS) {
-    fprintf(stderr, "signer: invalid n '%s'\n", argv[3]);
+  // const char *certfile = argv[1], *keyfile = argv[2];
+  if (sscanf(argv[1], "%hu", &g_my_id) != 1 || g_my_id < 1 ||
+      g_my_id > FROST_MAX_SIGNERS) {
+    fprintf(stderr, "signer: invalid id '%s' (must be 1..%d)\n", argv[3],
+            FROST_MAX_SIGNERS);
     return EXIT_FAILURE;
   }
-  if (sscanf(argv[4], "%hu", &g_t) != 1 || g_t < 1 || g_t > g_n) {
-    fprintf(stderr, "signer: invalid t '%s'\n", argv[4]);
+  if (sscanf(argv[2], "%hu", &g_n) != 1 || g_n < 2 || g_n > FROST_MAX_SIGNERS) {
+    fprintf(stderr, "signer: invalid n '%s'\n", argv[4]);
+    return EXIT_FAILURE;
+  }
+  if (sscanf(argv[3], "%hu", &g_t) != 1 || g_t < 1 || g_t > g_n) {
+    fprintf(stderr, "signer: invalid t '%s'\n", argv[5]);
+    return EXIT_FAILURE;
+  }
+  if (g_my_id > g_n) {
+    fprintf(stderr, "signer: id %u is out of range for n=%u\n", g_my_id, g_n);
     return EXIT_FAILURE;
   }
 
+  /* The DKG round-2 relay looks up every signer's public key by
+   * certs/signer<id>.crt (see get_signer_pubkey() in frost_stubs.c),
+   * and this process's own private key comes from whatever <key_file>
+   * was passed on the command line. Those two MUST correspond to the
+   * same keypair, or every RSA decryption of a routed round-2 package
+   * addressed to us will fail. Verify the identity files for the ID
+   * we're about to assert actually exist before we ever connect —
+   * this doesn't prove cert_file/key_file *are* those exact files, but
+   * it does catch the common misconfiguration (e.g. wrong --id, or
+   * certs/ never populated for this signer) up front instead of
+   * failing deep inside DKG round 2.                                */
+  char expected_cert[64], expected_key[64];
+  snprintf(expected_cert, sizeof(expected_cert), "certs/signer%u.crt", g_my_id);
+  snprintf(expected_key, sizeof(expected_key), "certs/signer%ukey.pem",
+           g_my_id);
+
+  {
+
+    struct stat st;
+    if (stat(expected_cert, &st) != 0) {
+      fprintf(stderr,
+              "signer: id %u asserted, but '%s' does not exist — refusing "
+              "to start (peers would encrypt to this signer using that "
+              "file)\n",
+              g_my_id, expected_cert);
+      return EXIT_FAILURE;
+    }
+    if (stat(expected_key, &st) != 0) {
+      fprintf(stderr,
+              "signer: id %u asserted, but '%s' does not exist — refusing "
+              "to start (this signer's own decryption key must live "
+              "there)\n",
+              g_my_id, expected_key);
+      return EXIT_FAILURE;
+    }
+  }
+
   /* optional fault injection */
-  for (int i = 5; i < argc; i++) {
+  for (int i = 4; i < argc; i++) {
     if (!strcmp(argv[i], "--fault") && i + 1 < argc) {
       i++;
       if (!strcmp(argv[i], "bad-share"))
@@ -909,15 +1053,29 @@ int main(int argc, char **argv) {
     return EXIT_FAILURE;
   }
 
+  /* The stat() checks above only prove *some* files exist at the
+   * expected paths. This proves the cert we were actually launched
+   * with is the same keypair peers will use to encrypt to us — i.e.
+   * that <cert_file> really is (a copy of) certs/signer<id>.crt, not
+   * just a file that happens to sit at that path. Without this, a
+   * signer could assert an ID it doesn't hold the matching private
+   * key for and still pass the earlier existence check.              */
+  if (verify_own_identity(g_my_id, expected_cert) != 0) {
+    return EXIT_FAILURE;
+  }
+  printf("signer: identity verified — '%s' matches certs/signer%u.crt\n",
+         expected_cert, g_my_id);
+
   /* GnuTLS setup */
   gnutls_certificate_credentials_t x509_cred;
   // gnutls_global_init();
   gnutls_certificate_allocate_credentials(&x509_cred);
   gnutls_certificate_set_x509_trust_file(x509_cred, FROST_CAFILE,
                                          GNUTLS_X509_FMT_PEM);
-  if (gnutls_certificate_set_x509_key_file(x509_cred, certfile, keyfile,
-                                           GNUTLS_X509_FMT_PEM) < 0) {
-    fprintf(stderr, "signer: failed to load '%s' / '%s'\n", certfile, keyfile);
+  if (gnutls_certificate_set_x509_key_file(
+          x509_cred, expected_cert, expected_key, GNUTLS_X509_FMT_PEM) < 0) {
+    fprintf(stderr, "signer: failed to load '%s' / '%s'\n", expected_cert,
+            expected_key);
     return EXIT_FAILURE;
   }
 
@@ -925,7 +1083,8 @@ int main(int argc, char **argv) {
   gnutls_privkey_init(&my_priv);
 
   gnutls_datum_t key_data;
-  gnutls_load_file(keyfile, &key_data); /* e.g. certs/signer{g_my_id}key.pem */
+  gnutls_load_file(expected_key,
+                   &key_data); /* e.g. certs/signer{g_my_id}key.pem */
   gnutls_privkey_import_x509_raw(my_priv, &key_data, GNUTLS_X509_FMT_PEM, NULL,
                                  0);
   gnutls_free(key_data.data);
@@ -939,9 +1098,12 @@ int main(int argc, char **argv) {
 
   /* Send HELLO */
   char hello[32];
-  int hlen = snprintf(hello, sizeof(hello), "SIGNER %u %u\n", g_n, g_t);
+  int hlen =
+      snprintf(hello, sizeof(hello), "SIGNER %u %u %u\n", g_my_id, g_n, g_t);
   queue_to_coord(FROST_MSG_HELLO, (uint8_t *)hello, (uint16_t)hlen);
-  printf("signer: sent HELLO n=%u t=%u\n", g_n, g_t);
+  printf("signer: sent HELLO id=%u n=%u t=%u — awaiting coordinator "
+         "confirmation\n",
+         g_my_id, g_n, g_t);
 
   /* Event loop */
   for (;;) {
@@ -980,6 +1142,16 @@ int main(int argc, char **argv) {
     }
     if (r == 0) {
       printf("signer %u: coordinator closed connection\n", g_my_id);
+      if (!g_id_confirmed) {
+        fprintf(stderr,
+                "signer: connection closed before ID %u was confirmed — "
+                "exiting\n",
+                g_my_id);
+        gnutls_deinit(g_coord_sess);
+        close(g_coord_sock);
+        gnutls_global_deinit();
+        return EXIT_FAILURE;
+      }
       break;
     }
     if (r < 0) {
