@@ -23,6 +23,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <gnutls/abstract.h>
+#include <gnutls/x509.h>
+
 #include "frost_common.h"
 
 /* ── hex helpers ──────────────────────────────────────────────── */
@@ -743,4 +746,80 @@ static int frost_sign(uint16_t my_id, const uint8_t *signing_pkg,
   printf("signer %u: sign ok — share=%u bytes\n", (unsigned)my_id,
          *sig_share_len);
   return 0;
+}
+
+/* Simple cache so we don't reopen/reparse the same cert file repeatedly */
+
+static gnutls_pubkey_t g_pubkey_cache[FROST_MAX_SIGNERS + 1] = {0};
+
+/* Load a single signer's public key from certs/signer{id}.crt
+ * Returns 0 on success, -1 on failure. */
+static int load_signer_pubkey(uint16_t id) {
+  char path[64];
+  snprintf(path, sizeof(path), "certs/signer%u.crt", id);
+
+  gnutls_datum_t cert_data;
+  if (gnutls_load_file(path, &cert_data) != GNUTLS_E_SUCCESS) {
+    fprintf(stderr, "signer: failed to load cert '%s'\n", path);
+    return -1;
+  }
+
+  gnutls_x509_crt_t cert;
+  gnutls_x509_crt_init(&cert);
+  if (gnutls_x509_crt_import(cert, &cert_data, GNUTLS_X509_FMT_PEM) !=
+      GNUTLS_E_SUCCESS) {
+    fprintf(stderr, "signer: failed to parse cert '%s'\n", path);
+    gnutls_free(cert_data.data);
+    gnutls_x509_crt_deinit(cert);
+    return -1;
+  }
+  gnutls_free(cert_data.data);
+
+  gnutls_pubkey_t pubkey;
+  gnutls_pubkey_init(&pubkey);
+  if (gnutls_pubkey_import_x509(pubkey, cert, 0) != GNUTLS_E_SUCCESS) {
+    fprintf(stderr, "signer: failed to extract pubkey from '%s'\n", path);
+    gnutls_x509_crt_deinit(cert);
+    gnutls_pubkey_deinit(pubkey);
+    return -1;
+  }
+  gnutls_x509_crt_deinit(cert);
+
+  g_pubkey_cache[id] = pubkey;
+  return 0;
+}
+
+/* Preload all signer public keys (1..FROST_MAX_SIGNERS) into the cache.
+ * Call once during signer initialization, before the DKG ceremony starts.
+ * Returns 0 if all loaded successfully, -1 if any failed. */
+static int init_signer_pubkey_cache(void) {
+  int rc = 0;
+  for (uint16_t id = 1; id <= FROST_MAX_SIGNERS; id++) {
+    if (load_signer_pubkey(id) != 0) {
+      fprintf(stderr, "signer: failed to preload pubkey for signer %u\n", id);
+      rc = -1;
+      /* keep going so we report all missing/broken certs at once,
+       * rather than bailing on the first failure */
+    }
+  }
+  return rc;
+}
+
+/* Cleanup — call at shutdown to free cached pubkey handles */
+static void free_signer_pubkey_cache(void) {
+  for (uint16_t id = 0; id <= FROST_MAX_SIGNERS; id++) {
+    if (g_pubkey_cache[id] != NULL) {
+      gnutls_pubkey_deinit(g_pubkey_cache[id]);
+      g_pubkey_cache[id] = NULL;
+    }
+  }
+}
+
+/* Accessor for use in your send loop */
+static gnutls_pubkey_t get_signer_pubkey(uint16_t id) {
+  if (id > FROST_MAX_SIGNERS || g_pubkey_cache[id] == NULL) {
+    fprintf(stderr, "signer: no cached pubkey for signer %u\n", id);
+    return NULL;
+  }
+  return g_pubkey_cache[id];
 }

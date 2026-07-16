@@ -44,8 +44,8 @@
 
 /* ── TLS certificate paths ────────────────────────────────────── */
 #define FROST_CAFILE "certs/rootCA.crt"
-#define FROST_COORD_CERT "certs/directory.crt"
-#define FROST_COORD_KEY "certs/directorykey.pem"
+#define FROST_COORD_CERT "certs/coordinator.crt"
+#define FROST_COORD_KEY "certs/coordinatorkey.pem"
 #define FROST_SIGNER1_CERT "certs/beocat.crt"
 #define FROST_SIGNER1_KEY "certs/beocatkey.pem"
 #define FROST_SIGNER2_CERT "certs/football.crt"
