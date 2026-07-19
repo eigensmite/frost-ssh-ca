@@ -914,10 +914,10 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
    * Coordinator sends the output file path once signing succeeds.
    */
   case FROST_MSG_CERT_OUTPUT: {
-    char path[256] = {0};
-    memcpy(path, payload, plen < 255 ? plen : 255);
-    printf("signer %u: *** certificate issued → %s ***\n", g_my_id, path);
-    printf("signer %u:     inspect: ssh-keygen -L -f %s\n", g_my_id, path);
+    // char path[256] = {0};
+    // memcpy(path, payload, plen < 255 ? plen : 255);
+    // printf("signer %u: *** certificate issued → %s ***\n", g_my_id, path);
+    // printf("signer %u:     inspect: ssh-keygen -L -f %s\n", g_my_id, path);
     break;
   }
 

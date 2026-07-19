@@ -861,8 +861,7 @@ static int verify_own_identity(uint16_t id, const char *cert_file) {
   gnutls_pubkey_t supplied_pub;
   gnutls_pubkey_init(&supplied_pub);
   if (gnutls_pubkey_import_x509(supplied_pub, cert, 0) != GNUTLS_E_SUCCESS) {
-    fprintf(stderr, "signer: failed to extract pubkey from '%s'\n",
-            cert_file);
+    fprintf(stderr, "signer: failed to extract pubkey from '%s'\n", cert_file);
     gnutls_x509_crt_deinit(cert);
     gnutls_pubkey_deinit(supplied_pub);
     return -1;
@@ -880,12 +879,11 @@ static int verify_own_identity(uint16_t id, const char *cert_file) {
   gnutls_datum_t expected_der = {0};
   int rc = -1;
 
-  if (gnutls_pubkey_export2(supplied_pub, GNUTLS_X509_FMT_DER,
-                            &supplied_der) != GNUTLS_E_SUCCESS ||
-      gnutls_pubkey_export2(expected_pub, GNUTLS_X509_FMT_DER,
-                            &expected_der) != GNUTLS_E_SUCCESS) {
-    fprintf(stderr,
-            "signer: failed to export a public key for comparison\n");
+  if (gnutls_pubkey_export2(supplied_pub, GNUTLS_X509_FMT_DER, &supplied_der) !=
+          GNUTLS_E_SUCCESS ||
+      gnutls_pubkey_export2(expected_pub, GNUTLS_X509_FMT_DER, &expected_der) !=
+          GNUTLS_E_SUCCESS) {
+    fprintf(stderr, "signer: failed to export a public key for comparison\n");
     goto out;
   }
 
