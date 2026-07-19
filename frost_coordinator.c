@@ -16,7 +16,7 @@
  *         [--serial   <n>]            cert serial number  (default 1)
  *         [--validity <secs>]         seconds from now    (default 86400)
  *         [--output   <file>]         output path  (default user_key-cert.pub)
- *
+ *         [==mass-mint <m>]           number of cert to create (default 1)
  * Certificate assembly delegates entirely to the Rust binary:
  *   Step 1 (startup): frost_signer_core tbs  → raw TBS bytes + dummy cert
  *   Step 2 (post-agg): frost_signer_core mint → real cert with FROST sig
@@ -137,9 +137,11 @@ static int g_n_blacklisted = 0;
 /* Sign-mode cert parameters */
 static char g_user_key_file[256] = "user_key.pub";
 static char g_principal[128] = "";
-static char g_output_file[256] = "user_key-cert.pub";
+static char g_output_file[256] = "./output/user_key-cert.pub";
 static uint64_t g_serial = 1;
 static uint64_t g_validity_secs = 86400;
+static uint64_t g_num_minted = 0;
+static uint64_t g_to_mint = 1; // default 1, set with [--mass-mint <m>]
 
 /* Num signers finished refresh */
 static int g_refresh_complete_count = 0;
@@ -263,6 +265,99 @@ static int call_tbs(uint64_t valid_after, uint64_t valid_before) {
   return 0;
 }
 
+static int b64_decode(const char *in, uint8_t *out, size_t max);
+static int prepare_tbs() {
+  /* Generate TBS and dummy cert template via Rust binary */
+  uint64_t now = (uint64_t)time(NULL);
+  if (call_tbs(now, now + g_validity_secs) != 0) {
+    fprintf(stderr, "coordinator: TBS generation failed\n");
+    return EXIT_FAILURE;
+  }
+
+  /* ── Patch the TBS: replace ephemeral CA key with real FROST CA key ── *
+   * The ssh_key library embeds SigningKey::public_key() in the TBS as    *
+   * the certificate's signature_key field.  In cmd_tbs this is an        *
+   * ephemeral key (so Builder::sign validation passes).  The last 32     *
+   * bytes of the TBS are the raw Ed25519 key bytes of that field.        *
+   * Replace them with the real FROST aggregate verifying key so FROST    *
+   * signs TBS bytes that will match what cmd_mint rebuilds.              */
+  {
+    if (g_tbs_len < 32) {
+      fprintf(stderr, "coordinator: TBS too short to patch (%u bytes)\n",
+              g_tbs_len);
+      return EXIT_FAILURE;
+    }
+
+    /* Get FROST CA verifying key (32 raw bytes) via pubkey subcommand */
+    char pub_hex[FROST_MAX_PAYLOAD * 2 + 4];
+    bytes_to_hex(g_pub_key_pkg, g_pub_key_pkg_len, pub_hex);
+
+    char pkmd_in[FROST_MAX_PAYLOAD * 2 + 8];
+    int pkmd_n = snprintf(pkmd_in, sizeof(pkmd_in), "%s\n", pub_hex);
+    char pkmd_tmp[] = "/tmp/frost_pkmd_XXXXXX";
+    int pkmd_fd = mkstemp(pkmd_tmp);
+    if (pkmd_fd < 0) {
+      perror("mkstemp pkmd");
+      return EXIT_FAILURE;
+    }
+    write(pkmd_fd, pkmd_in, (size_t)pkmd_n);
+    close(pkmd_fd);
+
+    char pkmd_cmd[256];
+    snprintf(pkmd_cmd, sizeof(pkmd_cmd), FROST_CORE_BIN " pubkey < %s",
+             pkmd_tmp);
+    FILE *pkfp = popen(pkmd_cmd, "r");
+    if (!pkfp) {
+      perror("popen pubkey");
+      unlink(pkmd_tmp);
+      return EXIT_FAILURE;
+    }
+
+    char pk_line[512];
+    if (!fgets(pk_line, sizeof(pk_line), pkfp)) {
+      fprintf(stderr, "coordinator: pubkey produced no output\n");
+      pclose(pkfp);
+      unlink(pkmd_tmp);
+      return EXIT_FAILURE;
+    }
+    pclose(pkfp);
+    unlink(pkmd_tmp);
+    pk_line[strcspn(pk_line, "\r\n")] = '\0';
+
+    /* Parse "ssh-ed25519 <base64> frost-ca" → 32-byte raw key */
+    char *sp1 = strchr(pk_line, ' ');
+    if (!sp1) {
+      fprintf(stderr, "coordinator: bad pubkey output\n");
+      return EXIT_FAILURE;
+    }
+    char *b64 = sp1 + 1;
+    char *sp2 = strchr(b64, ' ');
+    if (sp2)
+      *sp2 = '\0';
+
+    uint8_t wire[256];
+    int wlen = b64_decode(b64, wire, sizeof(wire));
+    if (wlen < 4 + 11 + 4 + 32) {
+      fprintf(stderr, "coordinator: pubkey decode too short (%d)\n", wlen);
+      return EXIT_FAILURE;
+    }
+    /* wire = [uint32=11]["ssh-ed25519"][uint32=32][32 bytes] */
+    uint8_t *frost_ca_key32 = wire + 4 + 11 + 4;
+
+    /* Patch: overwrite the last 32 bytes of TBS */
+    memcpy(g_tbs + g_tbs_len - 32, frost_ca_key32, 32);
+    /* Refresh the hex string the coordinator passes to mint */
+    bytes_to_hex(g_tbs, g_tbs_len, g_tbs_hex);
+    printf("coordinator: TBS patched with FROST CA key\n");
+  }
+
+  /* Clear ROAST sessions , but not blacklist, so bad nodes aren't retried */
+  memset(g_sessions, 0, sizeof(g_sessions));
+  // memset(g_blacklist, 0, sizeof(g_blacklist));
+
+  return EXIT_SUCCESS;
+}
+
 /*  Call frost_signer_core mint to inject the FROST aggregate signature
  *  into the dummy certificate template, producing a valid OpenSSH cert.
  *
@@ -352,6 +447,10 @@ static int call_mint(const uint8_t *sig64) {
   }
   fprintf(out, "%s\n", cert_line);
   fclose(out);
+
+  // g_serial++;
+  g_num_minted++;
+  g_to_mint--;
 
   printf("coordinator: *** SSH certificate written → %s ***\n", g_output_file);
   printf("coordinator: inspect: ssh-keygen -L -f %s\n", g_output_file);
@@ -623,7 +722,8 @@ static void check_refresh_all_confirmed(struct signerlist *list) {
   struct signer *sg, *tmp;
   LIST_FOREACH_SAFE(sg, list, entries, tmp)
   signer_send(sg, FROST_MSG_REFRESH_CONFIRMED, NULL, 0);
-  g_signing_done = 1; /* reuse flag to signal coordinator exit */
+  g_signing_done =
+      1; /* reuse flag to signal coordinator exit, or start new sig */
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1002,8 +1102,9 @@ static void roast_try_aggregate(struct signerlist *list,
     /* Notify all signers */
     struct signer *sg, *tmp;
     LIST_FOREACH_SAFE(sg, list, entries, tmp)
-    signer_send(sg, FROST_MSG_CERT_OUTPUT, (uint8_t *)g_output_file,
-                (uint16_t)strlen(g_output_file));
+    // signer_send(sg, FROST_MSG_CERT_OUTPUT, (uint8_t *)g_output_file,
+    //            (uint16_t)strlen(g_output_file));
+    signer_send(sg, FROST_MSG_CERT_OUTPUT, NULL, 0);
     return;
   }
 
@@ -1426,6 +1527,8 @@ int main(int argc, char **argv) {
       g_serial = (uint64_t)atol(argv[++i]);
     } else if (!strcmp(argv[i], "--validity") && i + 1 < argc) {
       g_validity_secs = (uint64_t)atol(argv[++i]);
+    } else if (!strcmp(argv[i], "--mass-mint") && i + 1 < argc) {
+      g_to_mint = (uint64_t)atol(argv[++i]);
     } else {
       fprintf(stderr, "coordinator: unknown option '%s'\n", argv[i]);
       return EXIT_FAILURE;
@@ -1434,6 +1537,10 @@ int main(int argc, char **argv) {
 
   /* Validate sign-mode parameters */
   if (g_mode == COORD_MODE_SIGN) {
+    /* Initialise ROAST state */
+    memset(g_sessions, 0, sizeof(g_sessions));
+    memset(g_blacklist, 0, sizeof(g_blacklist));
+
     if (strlen(g_principal) == 0) {
       fprintf(stderr, "coordinator: --principal required in sign mode\n");
       return EXIT_FAILURE;
@@ -1469,93 +1576,9 @@ int main(int argc, char **argv) {
              g_pub_key_pkg_len);
     }
 
-    /* Generate TBS and dummy cert template via Rust binary */
-    uint64_t now = (uint64_t)time(NULL);
-    if (call_tbs(now, now + g_validity_secs) != 0) {
-      fprintf(stderr, "coordinator: TBS generation failed\n");
+    /* PREPARE TBS */
+    if (prepare_tbs())
       return EXIT_FAILURE;
-    }
-
-    /* ── Patch the TBS: replace ephemeral CA key with real FROST CA key ── *
-     * The ssh_key library embeds SigningKey::public_key() in the TBS as    *
-     * the certificate's signature_key field.  In cmd_tbs this is an        *
-     * ephemeral key (so Builder::sign validation passes).  The last 32     *
-     * bytes of the TBS are the raw Ed25519 key bytes of that field.        *
-     * Replace them with the real FROST aggregate verifying key so FROST    *
-     * signs TBS bytes that will match what cmd_mint rebuilds.              */
-    {
-      if (g_tbs_len < 32) {
-        fprintf(stderr, "coordinator: TBS too short to patch (%u bytes)\n",
-                g_tbs_len);
-        return EXIT_FAILURE;
-      }
-
-      /* Get FROST CA verifying key (32 raw bytes) via pubkey subcommand */
-      char pub_hex[FROST_MAX_PAYLOAD * 2 + 4];
-      bytes_to_hex(g_pub_key_pkg, g_pub_key_pkg_len, pub_hex);
-
-      char pkmd_in[FROST_MAX_PAYLOAD * 2 + 8];
-      int pkmd_n = snprintf(pkmd_in, sizeof(pkmd_in), "%s\n", pub_hex);
-      char pkmd_tmp[] = "/tmp/frost_pkmd_XXXXXX";
-      int pkmd_fd = mkstemp(pkmd_tmp);
-      if (pkmd_fd < 0) {
-        perror("mkstemp pkmd");
-        return EXIT_FAILURE;
-      }
-      write(pkmd_fd, pkmd_in, (size_t)pkmd_n);
-      close(pkmd_fd);
-
-      char pkmd_cmd[256];
-      snprintf(pkmd_cmd, sizeof(pkmd_cmd), FROST_CORE_BIN " pubkey < %s",
-               pkmd_tmp);
-      FILE *pkfp = popen(pkmd_cmd, "r");
-      if (!pkfp) {
-        perror("popen pubkey");
-        unlink(pkmd_tmp);
-        return EXIT_FAILURE;
-      }
-
-      char pk_line[512];
-      if (!fgets(pk_line, sizeof(pk_line), pkfp)) {
-        fprintf(stderr, "coordinator: pubkey produced no output\n");
-        pclose(pkfp);
-        unlink(pkmd_tmp);
-        return EXIT_FAILURE;
-      }
-      pclose(pkfp);
-      unlink(pkmd_tmp);
-      pk_line[strcspn(pk_line, "\r\n")] = '\0';
-
-      /* Parse "ssh-ed25519 <base64> frost-ca" → 32-byte raw key */
-      char *sp1 = strchr(pk_line, ' ');
-      if (!sp1) {
-        fprintf(stderr, "coordinator: bad pubkey output\n");
-        return EXIT_FAILURE;
-      }
-      char *b64 = sp1 + 1;
-      char *sp2 = strchr(b64, ' ');
-      if (sp2)
-        *sp2 = '\0';
-
-      uint8_t wire[256];
-      int wlen = b64_decode(b64, wire, sizeof(wire));
-      if (wlen < 4 + 11 + 4 + 32) {
-        fprintf(stderr, "coordinator: pubkey decode too short (%d)\n", wlen);
-        return EXIT_FAILURE;
-      }
-      /* wire = [uint32=11]["ssh-ed25519"][uint32=32][32 bytes] */
-      uint8_t *frost_ca_key32 = wire + 4 + 11 + 4;
-
-      /* Patch: overwrite the last 32 bytes of TBS */
-      memcpy(g_tbs + g_tbs_len - 32, frost_ca_key32, 32);
-      /* Refresh the hex string the coordinator passes to mint */
-      bytes_to_hex(g_tbs, g_tbs_len, g_tbs_hex);
-      printf("coordinator: TBS patched with FROST CA key\n");
-    }
-
-    /* Initialise ROAST state */
-    memset(g_sessions, 0, sizeof(g_sessions));
-    memset(g_blacklist, 0, sizeof(g_blacklist));
   }
 
   if (g_mode == COORD_MODE_REFRESH) {
@@ -1627,15 +1650,25 @@ int main(int argc, char **argv) {
   for (;;) {
     /* In sign mode, exit once signing is complete and all queues flushed */
     if (g_signing_done && g_mode == COORD_MODE_SIGN) {
-      int all_quiet = 1;
-      struct signer *sg, *tmp;
-      LIST_FOREACH_SAFE(sg, &signers, entries, tmp)
-      if (!TAILQ_EMPTY(&sg->msgq)) {
-        all_quiet = 0;
-        break;
+      if (g_to_mint > 0) {
+        // TODO: prepare_tbs(), make sure serial and cert name are updated.
+        g_serial++;
+        snprintf(g_output_file, sizeof(g_output_file),
+                 "./output/user_key-cert-%lu.pub", g_serial);
+        prepare_tbs();
+        g_signing_done = 0;
+        broadcast_sign_req(&signers);
+      } else {
+        int all_quiet = 1;
+        struct signer *sg, *tmp;
+        LIST_FOREACH_SAFE(sg, &signers, entries, tmp)
+        if (!TAILQ_EMPTY(&sg->msgq)) {
+          all_quiet = 0;
+          break;
+        }
+        if (all_quiet)
+          break;
       }
-      if (all_quiet)
-        break;
     }
 
     fd_set readset, writeset;
@@ -1770,8 +1803,8 @@ int main(int argc, char **argv) {
       memcpy(hellobuf, st->inbuf + FROST_FRAME_HDR, cp);
       hellobuf[cp] = '\0';
       if (sscanf(hellobuf, "SIGNER %hu %hu %hu", &pid, &pn, &pt) != 3 ||
-          pid < 1 || pid > FROST_MAX_SIGNERS || pn < 2 || pt < 1 ||
-          pt > pn || pn > FROST_MAX_SIGNERS || pid > pn) {
+          pid < 1 || pid > FROST_MAX_SIGNERS || pn < 2 || pt < 1 || pt > pn ||
+          pn > FROST_MAX_SIGNERS || pid > pn) {
         const uint8_t *e = (const uint8_t *)"bad HELLO";
         staged_send(st, FROST_MSG_ERROR, e, (uint16_t)strlen((char *)e));
         continue;
@@ -1801,8 +1834,8 @@ int main(int argc, char **argv) {
         }
         if (id_taken) {
           char ebuf[64];
-          int elen = snprintf(ebuf, sizeof(ebuf),
-                              "ID %u already registered", pid);
+          int elen =
+              snprintf(ebuf, sizeof(ebuf), "ID %u already registered", pid);
           fprintf(stderr,
                   "coordinator: signer requested ID %u — already taken, "
                   "rejecting\n",
