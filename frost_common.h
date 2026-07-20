@@ -32,6 +32,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "checkpoint.h"
+
 /* ── Network ──────────────────────────────────────────────────── */
 #define FROST_COORD_HOST "127.0.0.1"
 #define FROST_COORD_PORT 60601
@@ -135,6 +137,7 @@ struct roast_session {
   uint32_t id;
   rsess_state_t state;
   time_t deadline;
+  double t_formed_ms; /* CLOCK_MONOTONIC ms at formation, for timing logs */
 
   int n_signers; /* == g_t */
   uint16_t signer_ids[FROST_MAX_SIGNERS];
@@ -181,6 +184,18 @@ struct outmsg {
        (var) && ((tvar) = TAILQ_NEXT((var), field), 1); (var) = (tvar))
 
 /* ── Frame helpers ────────────────────────────────────────────── */
+/* ── Timing instrumentation ───────────────────────────────────────
+ * Emits greppable "TIMING ..." lines to stderr so a log captured from
+ * a full run (stdout+stderr) can be parsed after the fact to build a
+ * time breakdown. Shared here (rather than duplicated per file) since
+ * frost_signer.c pulls in frost_stubs.c via #include in the same TU.
+static inline double now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
+}
+ */
+
 static inline int frost_encode_frame(uint8_t *dst, frost_msg_t type,
                                      const uint8_t *payload,
                                      uint16_t payload_len) {
