@@ -83,6 +83,7 @@ static int popen_roundtrip(const char *cmd, const char *stdin_data,
                            size_t stdin_len, char *line_out, size_t line_max) {
   /* We need bidirectional popen.  POSIX only gives us one direction,
    * so we write stdin via a temp file and read stdout via popen("r"). */
+  double t0 = now_ms();
 
   /* Write stdin to a temp file */
   char tmpfile[] = "/tmp/frost_stdin_XXXXXX";
@@ -116,11 +117,17 @@ static int popen_roundtrip(const char *cmd, const char *stdin_data,
     fprintf(stderr, "frost_stubs: no output from: %s\n", full_cmd);
     pclose(fp);
     unlink(tmpfile);
+    fprintf(stderr, "TIMING op=popen_roundtrip cmd=\"%s\" ms=%.3f ok=0\n", cmd,
+            now_ms() - t0);
     return -1;
   }
 
   int exit_code = pclose(fp);
   unlink(tmpfile);
+
+  double elapsed = now_ms() - t0;
+  fprintf(stderr, "TIMING op=popen_roundtrip cmd=\"%s\" ms=%.3f ok=%d\n", cmd,
+          elapsed, exit_code == 0 ? 1 : 0);
 
   if (exit_code != 0) {
     fprintf(stderr, "frost_stubs: command exited %d: %s\n", exit_code,
@@ -143,6 +150,7 @@ static int popen_roundtrip(const char *cmd, const char *stdin_data,
 static int popen_multi(const char *cmd, const char *stdin_lines[], int n_in,
                        char *stdout_lines[], const size_t line_maxes[],
                        int n_out) {
+  double t0 = now_ms();
   /* Build full stdin content */
   char stdin_buf[FROST_MAX_PAYLOAD * FROST_MAX_SIGNERS * 3];
   size_t off = 0;
@@ -190,6 +198,8 @@ static int popen_multi(const char *cmd, const char *stdin_lines[], int n_in,
       fprintf(stderr, "frost_stubs: EOF reading output line %d\n", i);
       pclose(fp);
       unlink(tmpfile);
+      fprintf(stderr, "TIMING op=popen_multi cmd=\"%s\" ms=%.3f ok=0\n", cmd,
+              now_ms() - t0);
       return -1;
     }
     /* strip trailing newline */
@@ -202,12 +212,19 @@ static int popen_multi(const char *cmd, const char *stdin_lines[], int n_in,
       fprintf(stderr, "frost_stubs: Rust error: %s\n", stdout_lines[i]);
       pclose(fp);
       unlink(tmpfile);
+      fprintf(stderr, "TIMING op=popen_multi cmd=\"%s\" ms=%.3f ok=0\n", cmd,
+              now_ms() - t0);
       return -1;
     }
   }
 
   int exit_code = pclose(fp);
   unlink(tmpfile);
+
+  double elapsed = now_ms() - t0;
+  fprintf(stderr, "TIMING op=popen_multi cmd=\"%s\" ms=%.3f ok=%d\n", cmd,
+          elapsed, exit_code == 0 ? 1 : 0);
+
   if (exit_code != 0) {
     fprintf(stderr, "frost_stubs: command failed (exit %d): %s\n", exit_code,
             full_cmd);
