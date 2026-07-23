@@ -35,7 +35,7 @@
 #include "checkpoint.c"
 
 /* ── Network ──────────────────────────────────────────────────── */
-#define FROST_COORD_HOST "127.0.0.1"
+#define FROST_COORD_HOST "192.168.0.170" // "127.0.0.1"
 #define FROST_COORD_PORT 60601
 
 /* ── Frame sizing ─────────────────────────────────────────────── */
