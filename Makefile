@@ -104,6 +104,8 @@ clean:
 	rm -f frost_coordinator frost_signer	
 	rm -f pub_key_pkg.hex frost_ca_signer_*.pub signature_pkg.hex
 	rm -f $(OUTPUT)
+
+wipe:
 	rm -f ./log/coord.log ./log/signer*.log
 
 clean-shares:
