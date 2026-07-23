@@ -84,6 +84,11 @@ static uint16_t g_pub_key_pkg_len = 0;
 static uint8_t g_nonces[FROST_MAX_PAYLOAD];
 static uint16_t g_nonces_len = 0;
 
+/* Commitment storage for at-request and pre-computation */
+static uint8_t g_commit[FROST_MAX_PAYLOAD];
+static uint16_t g_commit_len = 0;
+static uint8_t g_commit_is_precomputed = 0;
+
 /* Peer round-1 packages */
 static uint8_t g_peer_r1[FROST_MAX_SIGNERS][FROST_MAX_PAYLOAD];
 static uint16_t g_peer_r1_len[FROST_MAX_SIGNERS];
@@ -861,21 +866,23 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
 
     printf("signer %u: SIGN_REQ (%u TBS bytes) — generating commit\n", g_my_id,
            plen);
+
     g_state = DKG_SIGNING;
 
-    /* Reset nonces from any previous signing round to avoid reuse */
-    memset(g_nonces, 0, sizeof(g_nonces));
-    g_nonces_len = 0;
+    if (!g_commit_is_precomputed) {
+      /* Reset nonces from any previous signing round to avoid reuse */
+      memset(g_nonces, 0, sizeof(g_nonces));
+      g_nonces_len = 0;
 
-    uint8_t commit[FROST_MAX_PAYLOAD];
-    uint16_t commit_len = 0;
-    if (frost_commit(g_my_id, g_key_pkg, g_key_pkg_len, g_nonces, &g_nonces_len,
-                     commit, &commit_len) != 0) {
-      fprintf(stderr, "signer %u: frost_commit failed\n", g_my_id);
-      return;
+      if (frost_commit(g_my_id, g_key_pkg, g_key_pkg_len, g_nonces,
+                       &g_nonces_len, g_commit, &g_commit_len) != 0) {
+        fprintf(stderr, "signer %u: frost_commit failed\n", g_my_id);
+        return;
+      }
     }
-    queue_to_coord(FROST_MSG_COMMIT, commit, commit_len);
-    printf("signer %u: sent COMMIT (%u bytes)\n", g_my_id, commit_len);
+    queue_to_coord(FROST_MSG_COMMIT, g_commit, g_commit_len);
+    g_commit_is_precomputed = 0;
+    printf("signer %u: sent COMMIT (%u bytes)\n", g_my_id, g_commit_len);
     break;
   }
 
@@ -1195,6 +1202,23 @@ int main(int argc, char **argv) {
       continue;
     g_inptr = g_inbuf;
     process_coord_frame(msg_type, g_inbuf + FROST_FRAME_HDR, plen);
+
+    /* Pre-compute commitment */
+    if (g_coord_mode == COORD_MODE_SIGN) {
+      if (g_state == DKG_IDLE || g_state == DKG_COMPLETE) {
+        if (!g_commit_is_precomputed) {
+          memset(g_nonces, 0, sizeof(g_nonces));
+          g_nonces_len = 0;
+
+          if (frost_commit(g_my_id, g_key_pkg, g_key_pkg_len, g_nonces,
+                           &g_nonces_len, g_commit, &g_commit_len) != 0) {
+            fprintf(stderr, "signer %u: frost_commit failed\n", g_my_id);
+          } else {
+            g_commit_is_precomputed = 1;
+          }
+        }
+      }
+    }
   }
 
   gnutls_bye(g_coord_sess, GNUTLS_SHUT_RDWR);
