@@ -198,7 +198,7 @@ static int popen_multi(const char *cmd, const char *stdin_lines[], int n_in,
       fprintf(stderr, "frost_stubs: EOF reading output line %d\n", i);
       pclose(fp);
       unlink(tmpfile);
-      fprintf(stderr, "TIMING op=popen_multi cmd=\"%s\" ms=%.3f ok=0\n", cmd,
+      fprintf(stdout, "TIMING op=popen_multi cmd=\"%s\" ms=%.3f ok=0\n", cmd,
               now_ms() - t0);
       return -1;
     }
@@ -212,7 +212,7 @@ static int popen_multi(const char *cmd, const char *stdin_lines[], int n_in,
       fprintf(stderr, "frost_stubs: Rust error: %s\n", stdout_lines[i]);
       pclose(fp);
       unlink(tmpfile);
-      fprintf(stderr, "TIMING op=popen_multi cmd=\"%s\" ms=%.3f ok=0\n", cmd,
+      fprintf(stdout, "TIMING op=popen_multi cmd=\"%s\" ms=%.3f ok=0\n", cmd,
               now_ms() - t0);
       return -1;
     }
@@ -222,7 +222,7 @@ static int popen_multi(const char *cmd, const char *stdin_lines[], int n_in,
   unlink(tmpfile);
 
   double elapsed = now_ms() - t0;
-  fprintf(stderr, "TIMING op=popen_multi cmd=\"%s\" ms=%.3f ok=%d\n", cmd,
+  fprintf(stdout, "TIMING op=popen_multi cmd=\"%s\" ms=%.3f ok=%d\n", cmd,
           elapsed, exit_code == 0 ? 1 : 0);
 
   if (exit_code != 0) {
