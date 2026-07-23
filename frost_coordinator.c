@@ -194,26 +194,33 @@ static int call_tbs(uint64_t valid_after, uint64_t valid_before) {
     return -1;
   }
 
+  check_in(CP_TEMPFILE_WRITE);
   char tmpfile[] = "/tmp/frost_tbs_XXXXXX";
   int tmpfd = mkstemp(tmpfile);
   if (tmpfd < 0) {
     perror("mkstemp tbs");
+    check_out(CP_TEMPFILE_WRITE);
     return -1;
   }
   if (write(tmpfd, stdin_buf, (size_t)n) < 0) {
     perror("write tbs");
     close(tmpfd);
     unlink(tmpfile);
+    check_out(CP_TEMPFILE_WRITE);
+
     return -1;
   }
   close(tmpfd);
+  check_out(CP_TEMPFILE_WRITE);
 
   char cmd[256];
   snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " tbs < %s", tmpfile);
+  check_in(CP_TBS_BASH);
   FILE *fp = popen(cmd, "r");
   if (!fp) {
     perror("popen tbs");
     unlink(tmpfile);
+    check_out(CP_TBS_BASH);
     return -1;
   }
 
@@ -223,6 +230,7 @@ static int call_tbs(uint64_t valid_after, uint64_t valid_before) {
     fprintf(stderr, "coordinator: tbs produced no output\n");
     pclose(fp);
     unlink(tmpfile);
+    check_out(CP_TBS_BASH);
     return -1;
   }
   tbs_hex_line[strcspn(tbs_hex_line, "\r\n")] = '\0';
@@ -232,11 +240,13 @@ static int call_tbs(uint64_t valid_after, uint64_t valid_before) {
     fprintf(stderr, "coordinator: tbs missing dummy cert line\n");
     pclose(fp);
     unlink(tmpfile);
+    check_out(CP_TBS_BASH);
     return -1;
   }
   g_dummy_cert[strcspn(g_dummy_cert, "\r\n")] = '\0';
 
   int exit_code = pclose(fp);
+  check_out(CP_TBS_BASH);
   unlink(tmpfile);
 
   if (exit_code != 0) {
@@ -292,24 +302,30 @@ static int prepare_tbs() {
     char pub_hex[FROST_MAX_PAYLOAD * 2 + 4];
     bytes_to_hex(g_pub_key_pkg, g_pub_key_pkg_len, pub_hex);
 
+    check_in(CP_TEMPFILE_WRITE);
     char pkmd_in[FROST_MAX_PAYLOAD * 2 + 8];
     int pkmd_n = snprintf(pkmd_in, sizeof(pkmd_in), "%s\n", pub_hex);
     char pkmd_tmp[] = "/tmp/frost_pkmd_XXXXXX";
     int pkmd_fd = mkstemp(pkmd_tmp);
     if (pkmd_fd < 0) {
       perror("mkstemp pkmd");
+      check_out(CP_TEMPFILE_WRITE);
+
       return EXIT_FAILURE;
     }
     write(pkmd_fd, pkmd_in, (size_t)pkmd_n);
     close(pkmd_fd);
+    check_out(CP_TEMPFILE_WRITE);
 
     char pkmd_cmd[256];
     snprintf(pkmd_cmd, sizeof(pkmd_cmd), FROST_CORE_BIN " pubkey < %s",
              pkmd_tmp);
+    check_in(CP_TBS_PATCH_PUBKEY);
     FILE *pkfp = popen(pkmd_cmd, "r");
     if (!pkfp) {
       perror("popen pubkey");
       unlink(pkmd_tmp);
+      check_out(CP_TBS_PATCH_PUBKEY);
       return EXIT_FAILURE;
     }
 
@@ -318,9 +334,11 @@ static int prepare_tbs() {
       fprintf(stderr, "coordinator: pubkey produced no output\n");
       pclose(pkfp);
       unlink(pkmd_tmp);
+      check_out(CP_TBS_PATCH_PUBKEY);
       return EXIT_FAILURE;
     }
     pclose(pkfp);
+    check_out(CP_TBS_PATCH_PUBKEY);
     unlink(pkmd_tmp);
     pk_line[strcspn(pk_line, "\r\n")] = '\0';
 
@@ -395,11 +413,15 @@ static int call_mint(const uint8_t *sig64) {
     return -1;
   }
 
+  check_in(CP_TEMPFILE_WRITE);
+
   char tmpfile[] = "/tmp/frost_mint_XXXXXX";
   int tmpfd = mkstemp(tmpfile);
   if (tmpfd < 0) {
     perror("mkstemp mint");
     free(stdin_buf);
+    check_out(CP_TEMPFILE_WRITE);
+
     return -1;
   }
   if (write(tmpfd, stdin_buf, (size_t)n) < 0) {
@@ -407,17 +429,22 @@ static int call_mint(const uint8_t *sig64) {
     close(tmpfd);
     unlink(tmpfile);
     free(stdin_buf);
+    check_out(CP_TEMPFILE_WRITE);
+
     return -1;
   }
   close(tmpfd);
   free(stdin_buf);
+  check_out(CP_TEMPFILE_WRITE);
 
   char cmd[256];
   snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " mint < %s", tmpfile);
+  check_in(CP_MINT_BASH);
   FILE *fp = popen(cmd, "r");
   if (!fp) {
     perror("popen mint");
     unlink(tmpfile);
+    check_out(CP_MINT_BASH);
     return -1;
   }
 
@@ -427,11 +454,13 @@ static int call_mint(const uint8_t *sig64) {
     fprintf(stderr, "coordinator: mint produced no output\n");
     pclose(fp);
     unlink(tmpfile);
+    check_out(CP_MINT_BASH);
     return -1;
   }
   cert_line[strcspn(cert_line, "\r\n")] = '\0';
 
   int exit_code = pclose(fp);
+  check_out(CP_MINT_BASH);
   unlink(tmpfile);
 
   if (exit_code != 0) {
@@ -502,7 +531,9 @@ static void drain_signer_write(struct signer *sg, struct signerlist *list) {
   struct outmsg *m = TAILQ_FIRST(&sg->msgq);
   if (!m)
     return;
+  check_in(CP_TLS_RECORD_SEND);
   int r = gnutls_record_send(sg->session, m->data + m->sent, m->len - m->sent);
+  check_out(CP_TLS_RECORD_SEND);
   if (r == GNUTLS_E_AGAIN || r == GNUTLS_E_INTERRUPTED) {
     sg->want_write = gnutls_record_get_direction(sg->session);
     return;
@@ -525,7 +556,9 @@ static void drain_staged_write(struct staged_conn *st,
   struct outmsg *m = TAILQ_FIRST(&st->msgq);
   if (!m)
     return;
+  check_in(CP_TLS_RECORD_SEND);
   int r = gnutls_record_send(st->session, m->data + m->sent, m->len - m->sent);
+  check_out(CP_TLS_RECORD_SEND);
   if (r == GNUTLS_E_AGAIN || r == GNUTLS_E_INTERRUPTED) {
     st->want_write = gnutls_record_get_direction(st->session);
     return;
@@ -598,6 +631,7 @@ static void maybe_start_dkg(struct signerlist *list) {
 }
 
 static void relay_r1_to_all(struct signerlist *list, struct signer *sender) {
+  check_in(CP_DKG_RELAY_R1);
   uint8_t relay[FROST_MAX_PAYLOAD + 2];
   relay[0] = (uint8_t)(sender->id >> 8);
   relay[1] = (uint8_t)(sender->id & 0xFF);
@@ -607,17 +641,21 @@ static void relay_r1_to_all(struct signerlist *list, struct signer *sender) {
   LIST_FOREACH_SAFE(sg, list, entries, tmp)
   if (sg->id != sender->id)
     signer_send(sg, FROST_MSG_RELAY_R1, relay, rlen);
+  check_out(CP_DKG_RELAY_R1);
 }
 
 static void relay_r2_to_target(struct signerlist *list, uint16_t target_id,
                                const uint8_t *payload, uint16_t plen) {
+  check_in(CP_DKG_RELAY_R2);
   struct signer *sg, *tmp;
   LIST_FOREACH_SAFE(sg, list, entries, tmp)
   if (sg->id == target_id) {
     signer_send(sg, FROST_MSG_RELAY_R2, payload, plen);
+    check_out(CP_DKG_RELAY_R2);
     return;
   }
   fprintf(stderr, "coordinator: relay_r2 target %u not found\n", target_id);
+  check_out(CP_DKG_RELAY_R2);
 }
 
 static void check_r1_complete(struct signerlist *list) {
@@ -813,6 +851,7 @@ static int roast_try_form_session(struct signerlist *list) {
    * available, falling back to suspects only when necessary.       */
   uint16_t chosen[FROST_MAX_SIGNERS];
   int n_chosen = 0;
+  check_in(CP_ROAST_FORM_SESSION);
 
   struct signer *sg, *tmp;
   /* Pass 1 — reliable (zero strikes, SPHASE_COMMITTED) */
@@ -848,6 +887,7 @@ static int roast_try_form_session(struct signerlist *list) {
     }
   }
 
+  check_out(CP_ROAST_FORM_SESSION);
   if (n_chosen < (int)g_t)
     return 0;
 
@@ -887,21 +927,26 @@ static int roast_try_form_session(struct signerlist *list) {
     }
   }
 
+  check_in(CP_TEMPFILE_WRITE);
   char tmpfile[] = "/tmp/frost_assemble_XXXXXX";
   int tmpfd = mkstemp(tmpfile);
   if (tmpfd < 0) {
     perror("mkstemp assemble");
+    check_out(CP_TEMPFILE_WRITE);
     return 0;
   }
   write(tmpfd, assemble_in, off);
   close(tmpfd);
+  check_out(CP_TEMPFILE_WRITE);
 
   char cmd[256];
   snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " assemble < %s", tmpfile);
+  check_in(CP_ASSEMBLE_BASH);
   FILE *fp = popen(cmd, "r");
   if (!fp) {
     perror("popen assemble");
     unlink(tmpfile);
+    check_out(CP_ASSEMBLE_BASH);
     return 0;
   }
 
@@ -910,9 +955,11 @@ static int roast_try_form_session(struct signerlist *list) {
     fprintf(stderr, "coordinator: [ROAST] assemble produced no output\n");
     pclose(fp);
     unlink(tmpfile);
+    check_out(CP_ASSEMBLE_BASH);
     return 0;
   }
   int exit_code = pclose(fp);
+  check_out(CP_ASSEMBLE_BASH);
   unlink(tmpfile);
   if (exit_code != 0) {
     fprintf(stderr, "coordinator: [ROAST] assemble failed (exit %d)\n",
@@ -931,6 +978,7 @@ static int roast_try_form_session(struct signerlist *list) {
   sess->id = g_next_session_id++;
   sess->state = RSESS_AWAITING_SHARES;
   sess->deadline = time(NULL) + ROAST_SESSION_TIMEOUT_SEC;
+  sess->t_formed_ms = now_ms();
   sess->n_signers = n_chosen;
   sess->signing_pkg_len = (uint16_t)spkg_len;
   sess->n_shares = 0;
@@ -950,6 +998,10 @@ static int roast_try_form_session(struct signerlist *list) {
       break;
     }
   }
+  fprintf(stderr,
+          "BYTES msg=RELAY_COMMIT session=%u t=%d pkg_bytes=%d "
+          "recipients=%d total_bytes=%d\n",
+          sess->id, n_chosen, spkg_len, n_chosen, spkg_len * n_chosen);
 
   printf("coordinator: [ROAST] session %u formed — signers {", sess->id);
   for (int ci = 0; ci < n_chosen; ci++)
@@ -1052,22 +1104,27 @@ static void roast_try_aggregate(struct signerlist *list,
                             (unsigned)sess->signer_ids[si], sh_hex);
   }
 
+  check_in(CP_TEMPFILE_WRITE);
   char tmpfile[] = "/tmp/frost_agg_XXXXXX";
   int tmpfd = mkstemp(tmpfile);
   if (tmpfd < 0) {
     perror("mkstemp aggregate");
+    check_out(CP_TEMPFILE_WRITE);
     return;
   }
   write(tmpfd, agg_in, off);
   close(tmpfd);
+  check_out(CP_TEMPFILE_WRITE);
 
   char cmd[256];
   snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " aggregate --t %u < %s",
            (unsigned)g_t, tmpfile);
+  check_in(CP_AGGREGATE_BASH);
   FILE *fp = popen(cmd, "r");
   if (!fp) {
     perror("popen aggregate");
     unlink(tmpfile);
+    check_out(CP_AGGREGATE_BASH);
     return;
   }
 
@@ -1075,6 +1132,7 @@ static void roast_try_aggregate(struct signerlist *list,
   char first_line[256] = {0};
   int got_output = (fgets(first_line, sizeof(first_line), fp) != NULL);
   int exit_code = pclose(fp);
+  check_out(CP_AGGREGATE_BASH);
   unlink(tmpfile);
 
   /* ── Success ────────────────────────────────────────────────── */
@@ -1092,6 +1150,8 @@ static void roast_try_aggregate(struct signerlist *list,
     sess->state = RSESS_COMPLETE;
     g_signing_done = 1;
     printf("coordinator: [ROAST] session %u *** AGGREGATE OK ***\n", sess->id);
+    fprintf(stderr, "TIMING op=roast_session session=%u t=%d ms=%.3f ok=1\n",
+            sess->id, sess->n_signers, now_ms() - sess->t_formed_ms);
 
     /* Produce the final SSH certificate via mint */
     if (call_mint(sig64) != 0) {
@@ -1110,6 +1170,8 @@ static void roast_try_aggregate(struct signerlist *list,
 
 /* ── Failure path ───────────────────────────────────────────── */
 session_fail:;
+  fprintf(stderr, "TIMING op=roast_session session=%u t=%d ms=%.3f ok=0\n",
+          sess->id, sess->n_signers, now_ms() - sess->t_formed_ms);
   first_line[strcspn(first_line, "\r\n")] = '\0';
 
   if (strncmp(first_line, "CULPRIT:", 8) == 0) {
@@ -1164,6 +1226,7 @@ session_fail:;
  *  waiting longer than ROAST_SESSION_TIMEOUT_SEC for shares.
  */
 static void roast_expire_sessions(struct signerlist *list) {
+  check_in(CP_SESSION_EXPIRE_SCAN);
   time_t now = time(NULL);
   for (int i = 0; i < ROAST_MAX_SESSIONS; i++) {
     struct roast_session *s = &g_sessions[i];
@@ -1247,6 +1310,7 @@ static void roast_expire_sessions(struct signerlist *list) {
     if (!g_signing_done && roast_active_count() < ROAST_MAX_SESSIONS)
       roast_try_form_session(list);
   }
+  check_out(CP_SESSION_EXPIRE_SCAN);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -1339,12 +1403,14 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
       g_pub_key_pkg_len = plen;
       char hex[FROST_MAX_PAYLOAD * 2 + 2];
       bytes_to_hex(g_pub_key_pkg, g_pub_key_pkg_len, hex);
+      check_in(CP_PUBKEYPKG_WRITE);
       FILE *fp = fopen(FROST_PUB_PKG_HEX, "w");
       if (fp) {
         fprintf(fp, "%s\n", hex);
         fclose(fp);
         printf("coordinator: [REFRESH] new pub_key_pkg.hex written\n");
       }
+      check_out(CP_PUBKEYPKG_WRITE);
     }
     g_refresh_complete_count++;
     printf("coordinator: [REFRESH] signer %u confirmed new shares (%d/%u)\n",
@@ -1364,12 +1430,14 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
     {
       char hex[FROST_MAX_PAYLOAD * 2 + 2];
       bytes_to_hex(g_pub_key_pkg, g_pub_key_pkg_len, hex);
+      check_in(CP_PUBKEYPKG_WRITE);
       FILE *fp = fopen(FROST_PUB_PKG_HEX, "w");
       if (fp) {
         fprintf(fp, "%s\n", hex);
         fclose(fp);
         printf("coordinator: wrote " FROST_PUB_PKG_HEX "\n");
       }
+      check_out(CP_PUBKEYPKG_WRITE);
     }
     break;
 
@@ -1383,17 +1451,23 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
     break;
 
   case FROST_MSG_COMMIT:
-    if (g_mode != COORD_MODE_SIGN)
+    // check_in(CP_COMMIT_ROUTE);
+    if (g_mode != COORD_MODE_SIGN) {
+      // check_out(CP_COMMIT_ROUTE);
       break;
+    }
     if (sg->sign_phase != SPHASE_INIT &&
         sg->sign_phase != SPHASE_SUSPECT) { /* ← add SUSPECT here */
       fprintf(stderr, "coordinator: stray commit from signer %u (phase %d)\n",
               sg->id, (int)sg->sign_phase);
+      // check_out(CP_COMMIT_ROUTE);
       break;
     }
 
-    if (plen > FROST_MAX_PAYLOAD)
+    if (plen > FROST_MAX_PAYLOAD) {
+      // check_out(CP_COMMIT_ROUTE);
       return;
+    }
     memcpy(sg->commit, payload, plen);
     sg->commit_len = plen;
     sg->sign_phase = SPHASE_COMMITTED;
@@ -1403,25 +1477,33 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
     /* Try to form a session whenever a new commit lands */
     if (!g_signing_done && roast_active_count() < ROAST_MAX_SESSIONS)
       roast_try_form_session(list);
+    // check_out(CP_COMMIT_ROUTE);
     break;
 
   case FROST_MSG_SIG_SHARE: {
-    if (g_mode != COORD_MODE_SIGN)
+    // check_in(CP_SHARE_ROUTE);
+    if (g_mode != COORD_MODE_SIGN) {
+      // check_out(CP_SHARE_ROUTE);
       break;
-    if (plen > FROST_MAX_PAYLOAD)
+    }
+    if (plen > FROST_MAX_PAYLOAD) {
+      // check_out(CP_SHARE_ROUTE);
       return;
+    }
 
     struct roast_session *sess = roast_find(sg->session_id);
     if (!sess || sess->state != RSESS_AWAITING_SHARES) {
       fprintf(stderr,
               "coordinator: share from signer %u — no matching session\n",
               sg->id);
+      // check_out(CP_SHARE_ROUTE);
       break;
     }
     int slot = roast_signer_slot(sess, sg->id);
     if (slot < 0) {
       fprintf(stderr, "coordinator: share from signer %u not in session %u\n",
               sg->id, sess->id);
+      // check_out(CP_SHARE_ROUTE);
       break;
     }
     memcpy(sess->shares[slot], payload, plen);
@@ -1433,6 +1515,7 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
 
     if (sess->n_shares >= (int)g_t)
       roast_try_aggregate(list, sess);
+    // check_out(CP_SHARE_ROUTE);
     break;
   }
 
@@ -1535,6 +1618,8 @@ int main(int argc, char **argv) {
     }
   }
 
+  checkpoint_init("log/coord.log");
+
   /* Validate sign-mode parameters */
   if (g_mode == COORD_MODE_SIGN) {
     /* Initialise ROAST state */
@@ -1554,18 +1639,22 @@ int main(int argc, char **argv) {
     }
     {
       char hex[FROST_MAX_PAYLOAD * 2 + 4];
+      check_in(CP_PUBKEYPKG_LOAD);
       FILE *fp = fopen(FROST_PUB_PKG_HEX, "r");
       if (!fp) {
         perror(FROST_PUB_PKG_HEX);
+        check_out(CP_PUBKEYPKG_LOAD);
         return EXIT_FAILURE;
       }
       if (!fgets(hex, sizeof(hex), fp)) {
         fprintf(stderr, "coordinator: %s is empty\n", FROST_PUB_PKG_HEX);
         fclose(fp);
+        check_out(CP_PUBKEYPKG_LOAD);
         return EXIT_FAILURE;
       }
       fclose(fp);
       int plen = hex_to_bytes(hex, g_pub_key_pkg, FROST_MAX_PAYLOAD);
+      check_out(CP_PUBKEYPKG_LOAD);
       if (plen <= 0) {
         fprintf(stderr, "coordinator: failed to decode %s\n",
                 FROST_PUB_PKG_HEX);
@@ -1590,6 +1679,7 @@ int main(int argc, char **argv) {
       return EXIT_FAILURE;
     }
     char hex[FROST_MAX_PAYLOAD * 2 + 4];
+    check_in(CP_PUBKEYPKG_LOAD);
     FILE *fp = fopen(FROST_PUB_PKG_HEX, "r");
     if (fp && fgets(hex, sizeof(hex), fp)) {
       int plen = hex_to_bytes(hex, g_pub_key_pkg, FROST_MAX_PAYLOAD);
@@ -1597,6 +1687,7 @@ int main(int argc, char **argv) {
         g_pub_key_pkg_len = (uint16_t)plen;
       fclose(fp);
     }
+    check_out(CP_PUBKEYPKG_LOAD);
     /* Clear it so the post-refresh write from REFRESH_COMPLETE is accepted */
     g_pub_key_pkg_len = 0;
     printf("coordinator: [REFRESH] old pub_key_pkg verified — waiting for "
@@ -1698,7 +1789,9 @@ int main(int argc, char **argv) {
     }
 
     struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    check_in(CP_SELECT_BLKING_COORD);
     int sel = select(max_fd + 1, &readset, &writeset, NULL, &tv);
+    check_out(CP_SELECT_BLKING_COORD);
     if (sel < 0) {
       if (errno == EINTR)
         continue;
@@ -1734,7 +1827,9 @@ int main(int argc, char **argv) {
       gnutls_handshake_set_timeout(sess, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
       gnutls_priority_set_direct(sess, "NORMAL", NULL);
       gnutls_transport_set_int(sess, newsock);
+      check_in(CP_TLS_HANDSHAKE);
       int r = gnutls_handshake(sess);
+      check_out(CP_TLS_HANDSHAKE);
       if (r < 0) {
         gnutls_deinit(sess);
         close(newsock);
@@ -1767,8 +1862,10 @@ int main(int argc, char **argv) {
       if (!FD_ISSET(st->sockfd, &readset))
         continue;
 
+      check_in(CP_TLS_RECORD_RECV);
       int r = gnutls_record_recv(st->session, st->inptr,
                                  (st->inbuf + FROST_FRAME_MAX) - st->inptr);
+      check_out(CP_TLS_RECORD_RECV);
       if (r == GNUTLS_E_AGAIN || r == GNUTLS_E_INTERRUPTED) {
         st->want_write = gnutls_record_get_direction(st->session);
         continue;
@@ -1914,8 +2011,10 @@ int main(int argc, char **argv) {
       if (!FD_ISSET(sg->sockfd, &readset))
         continue;
 
+      check_in(CP_TLS_RECORD_RECV);
       int r = gnutls_record_recv(sg->session, sg->inptr,
                                  (sg->inbuf + FROST_FRAME_MAX) - sg->inptr);
+      check_out(CP_TLS_RECORD_RECV);
       if (r == GNUTLS_E_AGAIN || r == GNUTLS_E_INTERRUPTED) {
         sg->want_write = gnutls_record_get_direction(sg->session);
         continue;

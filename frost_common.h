@@ -32,7 +32,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "checkpoint.h"
+#include "checkpoint.c"
 
 /* ── Network ──────────────────────────────────────────────────── */
 #define FROST_COORD_HOST "127.0.0.1"
@@ -66,6 +66,65 @@
 /* ── ROAST session tuning ─────────────────────────────────────── */
 #define ROAST_MAX_SESSIONS 16
 #define ROAST_SESSION_TIMEOUT_SEC 10
+
+/* ── Checkpoint enum ids ──────────────────────────────────────── */
+/* NOTE on CP_ROAST_SESSION_TOTAL: this id is intentionally NOT wired
+ * to check_in()/check_out(). ROAST forms up to ROAST_MAX_SESSIONS
+ * concurrent signing sessions, but the checkpoint library keeps only
+ * one start-time slot per id — a second check_in() on the same id
+ * before the first session's check_out() clobbers its start time.
+ * Session-lifetime timing stays on the existing sess->t_formed_ms +
+ * now_ms() pattern (already correct, since it's stored per-session
+ * rather than in a single global slot). The id is kept here for
+ * documentation/consistency with the rest of the list, not for use
+ * with check_in/check_out.
+ */
+typedef enum {
+
+  /* ── Shared: event loop / network (coordinator + signer) ──────            */
+  CP_SELECT_BLKING_SIGNR, /* select() call each event-loop tick               */
+  CP_SELECT_BLKING_COORD, /*                                                  */
+  CP_TLS_HANDSHAKE, /* gnutls_handshake() — accept (coord) / connect (signer) */
+  CP_TLS_RECORD_RECV, /* gnutls_record_recv()                                 */
+  CP_TLS_RECORD_SEND, /* gnutls_record_send() (drain_*_write paths)           */
+  CP_TEMPFILE_WRITE,  /* creating and writing mkstemp file                    */
+  CP_TEMPFILE_LOAD,   /* reading mkstemp file                                 */
+
+  /* ── Coordinator: Rust subprocess bridge (previously untimed) ── */
+  CP_TBS_BASH,         /* call_tbs(): popen frost_signer_core tbs          */
+  CP_TBS_PATCH_PUBKEY, /* prepare_tbs(): popen frost_signer_core pubkey    */
+  CP_ASSEMBLE_BASH,    /* roast_try_form_session(): popen "assemble"       */
+  CP_AGGREGATE_BASH,   /* roast_try_aggregate(): popen "aggregate"         */
+  CP_MINT_BASH,        /* call_mint(): popen frost_signer_core mint        */
+
+  /* ── Coordinator: DKG relay ───────────────────────────────────── */
+  CP_DKG_RELAY_R1, /* relay_r1_to_all() broadcast loop                 */
+  CP_DKG_RELAY_R2, /* relay_r2_to_target() unicast lookup+send         */
+
+  /* ── Coordinator: ROAST session bookkeeping ──────────────────── */
+  CP_COMMIT_ROUTE,       /* FROST_MSG_COMMIT handler -> triggers form_session */
+  CP_ROAST_FORM_SESSION, /* roast_try_form_session(): two-pass selection scan*/
+  CP_SHARE_ROUTE,        /* FROST_MSG_SIG_SHARE handler -> triggers aggregate */
+  CP_ROAST_SESSION_TOTAL, /* NOT wired -- see note above                      */
+  CP_SESSION_EXPIRE_SCAN, /* roast_expire_sessions(): per-tick timeout sweep  */
+
+  /* ── Coordinator: disk I/O ────────────────────────────────────── */
+  CP_PUBKEYPKG_LOAD,  /* main(): read pub_key_pkg.hex                */
+  CP_PUBKEYPKG_WRITE, /* PUB_KEY_PKG / REFRESH_COMPLETE handlers writing it */
+
+  /* ── Signer: key persistence ──────────────────────────────────── */
+  CP_KEYPKG_LOAD, /* load_key_material()                              */
+  CP_KEYPKG_SAVE, /* save_key_material()                              */
+
+  /* ── Signer: startup-only identity setup ──────────────────────── */
+  CP_PUBKEY_CACHE_INIT, /* init_signer_pubkey_cache(): n cert loads at boot */
+  CP_VERIFY_IDENTITY,   /* verify_own_identity(): DER export + memcmp       */
+
+  /* ── Signer: per-message crypto ────────────────────────────────── */
+  CP_R2_DECRYPT,        /* gnutls_privkey_decrypt_data() on inbound r2 pkgs */
+  CP_FROST_COMMIT_BASH, /* frost_commit(): popen frost_signer_core commit   */
+  CP_FROST_SIGN_BASH,   /* frost_sign(): popen frost_signer_core sign       */
+} cp_id_t;
 
 /* ── Message type tags ────────────────────────────────────────── */
 typedef enum {
@@ -185,16 +244,14 @@ struct outmsg {
 
 /* ── Frame helpers ────────────────────────────────────────────── */
 /* ── Timing instrumentation ───────────────────────────────────────
- * Emits greppable "TIMING ..." lines to stderr so a log captured from
- * a full run (stdout+stderr) can be parsed after the fact to build a
- * time breakdown. Shared here (rather than duplicated per file) since
- * frost_signer.c pulls in frost_stubs.c via #include in the same TU.
-static inline double now_ms(void) {
-  struct timespec ts;
-  clock_gettime(CLOCK_MONOTONIC, &ts);
-  return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1e6;
-}
- */
+ * now_ms() is provided by checkpoint.h (included above) — this used
+ * to duplicate that definition locally, which caused a "redefinition
+ * of 'now_ms'" hard error once checkpoint.h was pulled in, since
+ * frost_signer.c also #includes frost_stubs.c into the same TU.
+ * check_in()/check_out() (also from checkpoint.h) emit the greppable
+ * per-checkpoint log lines described by the cp_id_t enum below;  the
+ * ad hoc "TIMING op=..." fprintf lines elsewhere in frost_stubs.c and
+ * frost_coordinator.c still use now_ms() directly and are unaffected. */
 
 static inline int frost_encode_frame(uint8_t *dst, frost_msg_t type,
                                      const uint8_t *payload,
