@@ -706,7 +706,10 @@ static int frost_commit(uint16_t my_id, const uint8_t *key_pkg,
   char *out_lines[2] = {nonces_hex, commit_hex};
   size_t out_maxes[2] = {HEX_LINE_MAX, HEX_LINE_MAX};
 
-  if (popen_multi(cmd, in_lines, 1, out_lines, out_maxes, 2) != 0)
+  check_in(CP_FROST_COMMIT_BASH);
+  int commit_rc = popen_multi(cmd, in_lines, 1, out_lines, out_maxes, 2);
+  check_out(CP_FROST_COMMIT_BASH);
+  if (commit_rc != 0)
     return -1;
 
   int nlen = hex_to_bytes(nonces_hex, nonces_out, FROST_MAX_PAYLOAD);
@@ -750,7 +753,10 @@ static int frost_sign(uint16_t my_id, const uint8_t *signing_pkg,
   char *out_lines[1] = {share_hex};
   size_t out_maxes[1] = {HEX_LINE_MAX};
 
-  if (popen_multi(cmd, in_lines, 3, out_lines, out_maxes, 1) != 0)
+  check_in(CP_FROST_SIGN_BASH);
+  int sign_rc = popen_multi(cmd, in_lines, 3, out_lines, out_maxes, 1);
+  check_out(CP_FROST_SIGN_BASH);
+  if (sign_rc != 0)
     return -1;
 
   int slen = hex_to_bytes(share_hex, sig_share_out, FROST_MAX_PAYLOAD);
@@ -810,6 +816,7 @@ static int load_signer_pubkey(uint16_t id) {
  * Call once during signer initialization, before the DKG ceremony starts.
  * Returns 0 if all loaded successfully, -1 if any failed. */
 static int init_signer_pubkey_cache(void) {
+  check_in(CP_PUBKEY_CACHE_INIT);
   int rc = 0;
   for (uint16_t id = 1; id <= FROST_MAX_SIGNERS; id++) {
     if (load_signer_pubkey(id) != 0) {
@@ -819,6 +826,7 @@ static int init_signer_pubkey_cache(void) {
        * rather than bailing on the first failure */
     }
   }
+  check_out(CP_PUBKEY_CACHE_INIT);
   return rc;
 }
 
@@ -856,10 +864,12 @@ static gnutls_pubkey_t get_signer_pubkey(uint16_t id) {
  * g_pubkey_cache[id]. Returns 0 on match, -1 on any mismatch or error
  * (a diagnostic is printed in every failure case).                   */
 static int verify_own_identity(uint16_t id, const char *cert_file) {
+  check_in(CP_VERIFY_IDENTITY);
   gnutls_datum_t cert_data;
   if (gnutls_load_file(cert_file, &cert_data) != GNUTLS_E_SUCCESS) {
     fprintf(stderr, "signer: failed to load '%s' for identity check\n",
             cert_file);
+    check_out(CP_VERIFY_IDENTITY);
     return -1;
   }
 
@@ -871,6 +881,7 @@ static int verify_own_identity(uint16_t id, const char *cert_file) {
             cert_file);
     gnutls_free(cert_data.data);
     gnutls_x509_crt_deinit(cert);
+    check_out(CP_VERIFY_IDENTITY);
     return -1;
   }
   gnutls_free(cert_data.data);
@@ -881,6 +892,7 @@ static int verify_own_identity(uint16_t id, const char *cert_file) {
     fprintf(stderr, "signer: failed to extract pubkey from '%s'\n", cert_file);
     gnutls_x509_crt_deinit(cert);
     gnutls_pubkey_deinit(supplied_pub);
+    check_out(CP_VERIFY_IDENTITY);
     return -1;
   }
   gnutls_x509_crt_deinit(cert);
@@ -889,6 +901,7 @@ static int verify_own_identity(uint16_t id, const char *cert_file) {
   gnutls_pubkey_t expected_pub = get_signer_pubkey(id);
   if (!expected_pub) {
     gnutls_pubkey_deinit(supplied_pub);
+    check_out(CP_VERIFY_IDENTITY);
     return -1; /* get_signer_pubkey() already printed a diagnostic */
   }
 
@@ -919,5 +932,6 @@ out:
   gnutls_free(supplied_der.data);
   gnutls_free(expected_der.data);
   gnutls_pubkey_deinit(supplied_pub);
+  check_out(CP_VERIFY_IDENTITY);
   return rc;
 }

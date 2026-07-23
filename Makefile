@@ -38,10 +38,10 @@ all: frost_coordinator frost_signer
 
 # ── Binaries ─────────────────────────────────────────────────────
 
-frost_coordinator: frost_coordinator.c frost_common.h frost_stubs.c checkpoint.c
+frost_coordinator: frost_coordinator.c frost_common.h frost_stubs.c checkpoint.h checkpoint.c
 	$(CC) $(CFLAGS) $(FROST_DEF) -o $@ frost_coordinator.c $(LDFLAGS)
 
-frost_signer: frost_signer.c frost_common.h frost_stubs.c checkpoint.c
+frost_signer: frost_signer.c frost_common.h frost_stubs.c checkpoint.h checkpoint.c
 	$(CC) $(CFLAGS) $(FROST_DEF) -o $@ frost_signer.c $(LDFLAGS)
 
 # ── DKG mode ─────────────────────────────────────────────────────

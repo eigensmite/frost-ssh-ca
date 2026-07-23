@@ -150,6 +150,7 @@ static void keypkg_path(uint16_t id, char *buf, size_t max) {
  *  AES-256-GCM encrypted blob (see file header note).
  */
 static int save_key_material(void) {
+  check_in(CP_KEYPKG_SAVE);
   mkdir(FROST_SHARES_DIR, 0700);
 
   char path[256];
@@ -161,6 +162,7 @@ static int save_key_material(void) {
   FILE *fp = fopen(path, "w");
   if (!fp) {
     perror(path);
+    check_out(CP_KEYPKG_SAVE);
     return -1;
   }
   fprintf(fp, "%s\n", hex);
@@ -176,6 +178,7 @@ static int save_key_material(void) {
     printf("signer %u: PublicKeyPackage saved → " FROST_PUB_PKG_HEX "\n",
            g_my_id);
   }
+  check_out(CP_KEYPKG_SAVE);
   return 0;
 }
 
@@ -183,16 +186,20 @@ static int save_key_material(void) {
  *  Returns 0 on success, -1 if the file is absent or unreadable.
  */
 static int load_key_material(void) {
+  check_in(CP_KEYPKG_LOAD);
   char path[256];
   keypkg_path(g_my_id, path, sizeof(path));
 
   FILE *fp = fopen(path, "r");
-  if (!fp)
+  if (!fp) {
+    check_out(CP_KEYPKG_LOAD);
     return -1; /* normal: node has never run DKG */
+  }
 
   char hex[FROST_MAX_PAYLOAD * 2 + 4];
   if (!fgets(hex, sizeof(hex), fp)) {
     fclose(fp);
+    check_out(CP_KEYPKG_LOAD);
     return -1;
   }
   fclose(fp);
@@ -200,6 +207,7 @@ static int load_key_material(void) {
   int klen = hex_to_bytes(hex, g_key_pkg, FROST_MAX_PAYLOAD);
   if (klen <= 0) {
     fprintf(stderr, "signer: bad hex in %s\n", path);
+    check_out(CP_KEYPKG_LOAD);
     return -1;
   }
   g_key_pkg_len = (uint16_t)klen;
@@ -218,6 +226,7 @@ static int load_key_material(void) {
 
   printf("signer %u: KeyPackage loaded from %s (%u bytes)\n", g_my_id, path,
          g_key_pkg_len);
+  check_out(CP_KEYPKG_LOAD);
   return 0;
 }
 
@@ -245,7 +254,9 @@ static int drain_outq(void) {
   struct outmsg *m = TAILQ_FIRST(&g_outq);
   if (!m)
     return 0;
+  check_in(CP_TLS_RECORD_SEND);
   int r = gnutls_record_send(g_coord_sess, m->data + m->sent, m->len - m->sent);
+  check_out(CP_TLS_RECORD_SEND);
   if (r == GNUTLS_E_AGAIN || r == GNUTLS_E_INTERRUPTED) {
     g_want_write = gnutls_record_get_direction(g_coord_sess);
     return 0;
@@ -290,7 +301,9 @@ static int connect_to_coordinator(gnutls_certificate_credentials_t cred) {
   gnutls_transport_set_int(g_coord_sess, sockfd);
 
   int r = 0;
+  check_in(CP_TLS_HANDSHAKE);
   LOOP_CHECK(r, gnutls_handshake(g_coord_sess));
+  check_out(CP_TLS_HANDSHAKE);
   if (r < 0) {
     if (r == GNUTLS_E_CERTIFICATE_VERIFICATION_ERROR) {
       gnutls_datum_t out;
@@ -502,7 +515,9 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
                                  .size = pkg_len};
     gnutls_datum_t plaintext;
 
+    check_in(CP_R2_DECRYPT);
     int rc = gnutls_privkey_decrypt_data(my_priv, 0, &ciphertext, &plaintext);
+    check_out(CP_R2_DECRYPT);
     if (rc < 0) {
       fprintf(stderr, "signer %u: decrypt failed: %s\n", g_my_id,
               gnutls_strerror(rc));
@@ -724,7 +739,9 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
                                  .size = pkg_len};
     gnutls_datum_t plaintext;
 
+    check_in(CP_R2_DECRYPT);
     int rc = gnutls_privkey_decrypt_data(my_priv, 0, &ciphertext, &plaintext);
+    check_out(CP_R2_DECRYPT);
     if (rc < 0) {
       fprintf(stderr, "signer %u: decrypt failed: %s\n", g_my_id,
               gnutls_strerror(rc));
@@ -1047,6 +1064,10 @@ int main(int argc, char **argv) {
 
   gnutls_global_init();
 
+  char log_file[32] = {'\0'};
+  snprintf(log_file, 32, "log/signer%u.log", g_my_id);
+  checkpoint_init(log_file);
+
   if (init_signer_pubkey_cache() != 0) {
     fprintf(stderr,
             "signer: one or more signer certs failed to load — aborting\n");
@@ -1116,7 +1137,9 @@ int main(int argc, char **argv) {
       FD_SET(g_coord_sock, &readset);
 
     struct timeval tv = {.tv_sec = 0, .tv_usec = 500000};
+    check_in(CP_SELECT_BLKING_SIGNR);
     int sel = select(g_coord_sock + 1, &readset, &writeset, NULL, &tv);
+    check_out(CP_SELECT_BLKING_SIGNR);
     if (sel < 0) {
       if (errno == EINTR)
         continue;
@@ -1134,8 +1157,10 @@ int main(int argc, char **argv) {
     if (!FD_ISSET(g_coord_sock, &readset))
       continue;
 
+    check_in(CP_TLS_RECORD_RECV);
     int r = gnutls_record_recv(g_coord_sess, g_inptr,
                                (g_inbuf + FROST_FRAME_MAX) - g_inptr);
+    check_out(CP_TLS_RECORD_RECV);
     if (r == GNUTLS_E_AGAIN || r == GNUTLS_E_INTERRUPTED) {
       g_want_write = gnutls_record_get_direction(g_coord_sess);
       continue;
