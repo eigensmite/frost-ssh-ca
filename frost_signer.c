@@ -53,9 +53,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-#include <gnutls/gnutls.h>
-#include <gnutls/x509.h>
-
 #include "frost_common.h"
 #include "frost_stubs.c"
 
@@ -244,15 +241,26 @@ static void queue_to_coord(frost_msg_t type, const uint8_t *payload,
   struct outmsg *m = malloc(sizeof(*m));
   if (!m)
     return;
-  m->len = (size_t)(FROST_FRAME_HDR + plen);
+  m->len = (size_t)(FROST_FRAME_HDR + FROST_FRAME_SIG_SIZE + plen);
   m->sent = 0;
   m->data = malloc(m->len);
   if (!m->data) {
     free(m);
     return;
   }
-  frost_encode_frame(m->data, type, payload, plen);
+
+  gnutls_datum_t data = {.data = (unsigned char *)payload, .size = plen};
+  gnutls_datum_t sig; // MUST FREE
+  if (gnutls_privkey_sign_data2(my_priv, GNUTLS_SIGN_RSA_SHA256, 0, &data,
+                                &sig) < 0) {
+    fprintf(stderr, "signer %u: sig creation failed\n", g_my_id);
+  }
+
+  frost_encode_frame(m->data, type, (uint8_t *)sig.data, sig.size, payload,
+                     plen);
   TAILQ_INSERT_TAIL(&g_outq, m, entries);
+
+  gnutls_free(sig.data);
 }
 
 static int drain_outq(void) {
@@ -332,8 +340,9 @@ static int connect_to_coordinator(gnutls_certificate_credentials_t cred) {
  * Frame dispatch
  * ══════════════════════════════════════════════════════════════════ */
 
-static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
-                                uint16_t plen) {
+static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
+                                const uint8_t *payload, uint16_t plen) {
+
   switch (type) {
 
   /* ── HELLO_ACK ────────────────────────────────────────────────
@@ -342,6 +351,7 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
    * to load key material from disk.
    */
   case FROST_MSG_HELLO_ACK: {
+    printf("CHECKPOINT\n");
     char buf[32] = {0};
     memcpy(buf, payload, plen < 31 ? plen : 31);
     char mode_char = 'D';
@@ -417,6 +427,20 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     if (plen < 2)
       return;
     uint16_t sender_id = (uint16_t)(((uint16_t)payload[0] << 8) | payload[1]);
+
+    gnutls_pubkey_t sender_pubkey = get_signer_pubkey(sender_id);
+
+    gnutls_datum_t data = {.data = (unsigned char *)&payload[2],
+                           .size = plen - 2};
+
+    if (gnutls_pubkey_verify_data2(sender_pubkey, GNUTLS_SIGN_RSA_SHA256, 0,
+                                   &data,
+                                   &sig) == GNUTLS_E_PK_SIG_VERIFY_FAILED) {
+      fprintf(stderr, "signer %u: r1 package verification failed\n", g_my_id);
+      return;
+    }
+    printf("signer %u: r1 package from id=%u verified\n", g_my_id, sender_id);
+
     uint16_t pkg_len = (uint16_t)(plen - 2);
     if (g_peer_r1_count >= FROST_MAX_SIGNERS)
       return;
@@ -511,6 +535,18 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     if (plen < 4)
       return;
     uint16_t sender_id = (uint16_t)(((uint16_t)payload[0] << 8) | payload[1]);
+
+    gnutls_pubkey_t sender_pubkey = get_signer_pubkey(sender_id);
+    gnutls_datum_t data = {.data = (unsigned char *)&payload[0], .size = plen};
+
+    if (gnutls_pubkey_verify_data2(sender_pubkey, GNUTLS_SIGN_RSA_SHA256, 0,
+                                   &data,
+                                   &sig) == GNUTLS_E_PK_SIG_VERIFY_FAILED) {
+      fprintf(stderr, "signer %u: r2 package verification failed\n", g_my_id);
+      return;
+    }
+    printf("signer %u: r2 package from id=%u verified\n", g_my_id, sender_id);
+
     uint16_t pkg_len = (uint16_t)(plen - 4);
     if (g_peer_r2_count >= FROST_MAX_SIGNERS)
       return;
@@ -645,6 +681,19 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     if (plen < 2)
       return;
     uint16_t sender_id = (uint16_t)(((uint16_t)payload[0] << 8) | payload[1]);
+
+    gnutls_pubkey_t sender_pubkey = get_signer_pubkey(sender_id);
+    gnutls_datum_t data = {.data = (unsigned char *)&payload[2],
+                           .size = plen - 2};
+
+    if (gnutls_pubkey_verify_data2(sender_pubkey, GNUTLS_SIGN_RSA_SHA256, 0,
+                                   &data,
+                                   &sig) == GNUTLS_E_PK_SIG_VERIFY_FAILED) {
+      fprintf(stderr, "signer %u: r1 package verification failed\n", g_my_id);
+      return;
+    }
+    printf("signer %u: r1 package from id=%u verified\n", g_my_id, sender_id);
+
     uint16_t pkg_len = (uint16_t)(plen - 2);
     if (g_ref_peer_r1_count >= FROST_MAX_SIGNERS)
       return;
@@ -686,6 +735,8 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
 
       gnutls_datum_t plaintext = {.data = r2_out[i], .size = r2_lens[i]};
       gnutls_datum_t ciphertext;
+
+      gnutls_sign_algorithm_t bob;
 
       int rc = gnutls_pubkey_encrypt_data(pub, 0, &plaintext, &ciphertext);
       if (rc < 0) {
@@ -735,6 +786,18 @@ static void process_coord_frame(frost_msg_t type, const uint8_t *payload,
     if (plen < 4)
       return;
     uint16_t sender_id = (uint16_t)(((uint16_t)payload[0] << 8) | payload[1]);
+
+    gnutls_pubkey_t sender_pubkey = get_signer_pubkey(sender_id);
+    gnutls_datum_t data = {.data = (unsigned char *)&payload[0], .size = plen};
+
+    if (gnutls_pubkey_verify_data2(sender_pubkey, GNUTLS_SIGN_RSA_SHA256, 0,
+                                   &data,
+                                   &sig) == GNUTLS_E_PK_SIG_VERIFY_FAILED) {
+      fprintf(stderr, "signer %u: r2 package verification failed\n", g_my_id);
+      return;
+    }
+    printf("signer %u: r2 package from id=%u verified\n", g_my_id, sender_id);
+
     uint16_t pkg_len = (uint16_t)(plen - 4);
     if (g_ref_peer_r2_count >= FROST_MAX_SIGNERS)
       return;
@@ -1197,11 +1260,13 @@ int main(int argc, char **argv) {
     if ((g_inptr - g_inbuf) < FROST_FRAME_HDR)
       continue;
     frost_msg_t msg_type;
-    uint16_t plen = frost_decode_header(g_inbuf, &msg_type);
-    if ((g_inptr - g_inbuf) < (int)(FROST_FRAME_HDR + plen))
+    gnutls_datum_t sig;
+    uint16_t plen = frost_decode_header(g_inbuf, &msg_type, &sig);
+    if ((g_inptr - g_inbuf) < (int)(FROST_FRAME_HDR + sig.size + plen))
       continue;
     g_inptr = g_inbuf;
-    process_coord_frame(msg_type, g_inbuf + FROST_FRAME_HDR, plen);
+    process_coord_frame(msg_type, sig, g_inbuf + FROST_FRAME_HDR + sig.size,
+                        plen);
 
     /* Pre-compute commitment */
     if (g_coord_mode == COORD_MODE_SIGN) {
