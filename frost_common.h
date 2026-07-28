@@ -32,17 +32,24 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <gnutls/gnutls.h>
+#include <gnutls/x509.h>
+
 #include "checkpoint.c"
 
 /* ── Network ──────────────────────────────────────────────────── */
-#define FROST_COORD_HOST "192.168.0.170" // "127.0.0.1"
+#define FROST_COORD_HOST "127.0.0.1" // "192.168.0.170" // "127.0.0.1"
 #define FROST_COORD_PORT 60601
 
+#define TLS_RSA_KEY_BIT_LEN 2048
+
 /* ── Frame sizing ─────────────────────────────────────────────── */
-#define FROST_MAX_PAYLOAD 4096
-#define FROST_FRAME_HDR 3
-#define FROST_FRAME_MAX (FROST_FRAME_HDR + FROST_MAX_PAYLOAD)
-#define FROST_MAX_SIGNERS 16
+#define FROST_MAX_PAYLOAD 8192
+#define FROST_FRAME_HDR 5
+#define FROST_FRAME_SIG_SIZE (TLS_RSA_KEY_BIT_LEN / 8)
+#define FROST_FRAME_MAX                                                        \
+  (FROST_FRAME_HDR + FROST_FRAME_SIG_SIZE + FROST_MAX_PAYLOAD)
+#define FROST_MAX_SIGNERS 96
 
 /* ── TLS certificate paths ────────────────────────────────────── */
 #define FROST_CAFILE "certs/rootCA.crt"
@@ -254,6 +261,7 @@ struct outmsg {
  * frost_coordinator.c still use now_ms() directly and are unaffected. */
 
 static inline int frost_encode_frame(uint8_t *dst, frost_msg_t type,
+                                     const uint8_t *signature, uint16_t sig_len,
                                      const uint8_t *payload,
                                      uint16_t payload_len) {
   if (payload_len > FROST_MAX_PAYLOAD)
@@ -261,14 +269,28 @@ static inline int frost_encode_frame(uint8_t *dst, frost_msg_t type,
   dst[0] = (uint8_t)type;
   dst[1] = (uint8_t)(payload_len >> 8);
   dst[2] = (uint8_t)(payload_len & 0xFF);
+  dst[3] = (uint8_t)(sig_len >> 8);
+  dst[4] = (uint8_t)(sig_len & 0xFF);
+  if (signature != NULL && sig_len != FROST_FRAME_SIG_SIZE)
+    fprintf(stderr,
+            "sig_len= %u, must be equal to FROST_FRAME_SIG_SIZE= %u, check "
+            "TLS_RSA_KEY_BIT_LEN\n",
+            sig_len, FROST_FRAME_SIG_SIZE);
+
+  if (signature && sig_len > 0)
+    memcpy(dst + FROST_FRAME_HDR, signature, sig_len);
   if (payload && payload_len > 0)
-    memcpy(dst + FROST_FRAME_HDR, payload, payload_len);
-  return FROST_FRAME_HDR + payload_len;
+    memcpy(dst + FROST_FRAME_HDR + sig_len, payload, payload_len);
+  return FROST_FRAME_HDR + sig_len + payload_len;
 }
 
 static inline uint16_t frost_decode_header(const uint8_t *buf,
-                                           frost_msg_t *type_out) {
+                                           frost_msg_t *type_out,
+                                           gnutls_datum_t *sig_out) {
   *type_out = (frost_msg_t)buf[0];
+  *sig_out =
+      (gnutls_datum_t){.data = (unsigned char *)&buf[5],
+                       .size = (uint16_t)(((uint16_t)buf[3] << 8) | buf[4])};
   return (uint16_t)(((uint16_t)buf[1] << 8) | buf[2]);
 }
 

@@ -52,9 +52,6 @@
 #include <time.h>
 #include <unistd.h>
 
-#include <gnutls/gnutls.h>
-#include <gnutls/x509.h>
-
 #include "frost_common.h"
 #include "frost_stubs.c" /* bytes_to_hex, hex_to_bytes, popen_multi, … */
 
@@ -75,6 +72,7 @@ struct signer {
   int want_write;
 
   /* DKG relay buffers */
+  uint8_t r1_sig[FROST_FRAME_SIG_SIZE];
   uint8_t r1_pkg[FROST_MAX_PAYLOAD];
   uint16_t r1_len;
   int r2_complete;
@@ -491,18 +489,20 @@ static int call_mint(const uint8_t *sig64) {
  * ══════════════════════════════════════════════════════════════════ */
 
 static void signer_send(struct signer *sg, frost_msg_t type,
+                        const uint8_t *signature, uint16_t slen,
                         const uint8_t *payload, uint16_t plen) {
   struct outmsg *m = malloc(sizeof(*m));
   if (!m)
     return;
-  m->len = (size_t)(FROST_FRAME_HDR + plen);
+  m->len = (size_t)(FROST_FRAME_HDR + slen + plen);
   m->sent = 0;
   m->data = malloc(m->len);
   if (!m->data) {
     free(m);
     return;
   }
-  frost_encode_frame(m->data, type, payload, plen);
+  frost_encode_frame(m->data, type, signature, slen, payload, plen);
+  // printf("%s\n", m->data + FROST_FRAME_HDR);
   TAILQ_INSERT_TAIL(&sg->msgq, m, entries);
 }
 
@@ -518,7 +518,8 @@ static void staged_send(struct staged_conn *st, frost_msg_t type,
     free(m);
     return;
   }
-  frost_encode_frame(m->data, type, payload, plen);
+  frost_encode_frame(m->data, type, NULL, 0, payload, plen);
+  // printf("%s\n", m->data);
   TAILQ_INSERT_TAIL(&st->msgq, m, entries);
 }
 
@@ -627,7 +628,7 @@ static void maybe_start_dkg(struct signerlist *list) {
   char buf[32];
   int blen = snprintf(buf, sizeof(buf), "START_DKG %u %u\n", g_n, g_t);
   LIST_FOREACH_SAFE(sg, list, entries, tmp)
-  signer_send(sg, FROST_MSG_START_DKG, (uint8_t *)buf, (uint16_t)blen);
+  signer_send(sg, FROST_MSG_START_DKG, NULL, 0, (uint8_t *)buf, (uint16_t)blen);
 }
 
 static void relay_r1_to_all(struct signerlist *list, struct signer *sender) {
@@ -640,17 +641,19 @@ static void relay_r1_to_all(struct signerlist *list, struct signer *sender) {
   struct signer *sg, *tmp;
   LIST_FOREACH_SAFE(sg, list, entries, tmp)
   if (sg->id != sender->id)
-    signer_send(sg, FROST_MSG_RELAY_R1, relay, rlen);
+    signer_send(sg, FROST_MSG_RELAY_R1, sender->r1_sig, FROST_FRAME_SIG_SIZE,
+                relay, rlen);
   check_out(CP_DKG_RELAY_R1);
 }
 
 static void relay_r2_to_target(struct signerlist *list, uint16_t target_id,
+                               const uint8_t *signature, uint16_t slen,
                                const uint8_t *payload, uint16_t plen) {
   check_in(CP_DKG_RELAY_R2);
   struct signer *sg, *tmp;
   LIST_FOREACH_SAFE(sg, list, entries, tmp)
   if (sg->id == target_id) {
-    signer_send(sg, FROST_MSG_RELAY_R2, payload, plen);
+    signer_send(sg, FROST_MSG_RELAY_R2, signature, slen, payload, plen);
     check_out(CP_DKG_RELAY_R2);
     return;
   }
@@ -682,7 +685,7 @@ static void check_r2_complete(struct signerlist *list) {
   char buf[32];
   int blen = snprintf(buf, sizeof(buf), "DKG_DONE %u\n", g_n);
   LIST_FOREACH_SAFE(sg, list, entries, tmp)
-  signer_send(sg, FROST_MSG_DKG_DONE, (uint8_t *)buf, (uint16_t)blen);
+  signer_send(sg, FROST_MSG_DKG_DONE, NULL, 0, (uint8_t *)buf, (uint16_t)blen);
   g_dkg_state = DKG_COMPLETE;
 }
 
@@ -707,7 +710,8 @@ static void maybe_start_refresh(struct signerlist *list) {
   char buf[32];
   int blen = snprintf(buf, sizeof(buf), "START_REFRESH %u %u\n", g_n, g_t);
   LIST_FOREACH_SAFE(sg, list, entries, tmp)
-  signer_send(sg, FROST_MSG_START_REFRESH, (uint8_t *)buf, (uint16_t)blen);
+  signer_send(sg, FROST_MSG_START_REFRESH, NULL, 0, (uint8_t *)buf,
+              (uint16_t)blen);
 }
 
 static void relay_refresh_r1_to_all(struct signerlist *list,
@@ -720,7 +724,8 @@ static void relay_refresh_r1_to_all(struct signerlist *list,
   struct signer *sg, *tmp;
   LIST_FOREACH_SAFE(sg, list, entries, tmp)
   if (sg->id != sender->id)
-    signer_send(sg, FROST_MSG_RELAY_REFRESH_R1, relay, rlen);
+    signer_send(sg, FROST_MSG_RELAY_REFRESH_R1, sender->r1_sig,
+                FROST_FRAME_SIG_SIZE, relay, rlen);
 }
 
 static void check_refresh_r1_complete(struct signerlist *list) {
@@ -747,7 +752,7 @@ static void check_refresh_r2_complete(struct signerlist *list) {
   printf(
       "coordinator: [REFRESH] all r2 done — broadcasting REFRESH_FINALIZE\n");
   LIST_FOREACH_SAFE(sg, list, entries, tmp)
-  signer_send(sg, FROST_MSG_REFRESH_FINALIZE, NULL, 0);
+  signer_send(sg, FROST_MSG_REFRESH_FINALIZE, NULL, 0, NULL, 0);
   g_dkg_state = DKG_COMPLETE;
 }
 
@@ -759,7 +764,7 @@ static void check_refresh_all_confirmed(struct signerlist *list) {
          g_n);
   struct signer *sg, *tmp;
   LIST_FOREACH_SAFE(sg, list, entries, tmp)
-  signer_send(sg, FROST_MSG_REFRESH_CONFIRMED, NULL, 0);
+  signer_send(sg, FROST_MSG_REFRESH_CONFIRMED, NULL, 0, NULL, 0);
   g_signing_done =
       1; /* reuse flag to signal coordinator exit, or start new sig */
 }
@@ -824,7 +829,7 @@ static void broadcast_sign_req(struct signerlist *list) {
     sg->commit_len = 0;
     sg->sig_share_len = 0;
     sg->session_id = 0;
-    signer_send(sg, FROST_MSG_SIGN_REQ, g_tbs, g_tbs_len);
+    signer_send(sg, FROST_MSG_SIGN_REQ, NULL, 0, g_tbs, g_tbs_len);
     printf("coordinator: [ROAST] SIGN_REQ → signer %u\n", sg->id);
   }
 }
@@ -994,7 +999,8 @@ static int roast_try_form_session(struct signerlist *list) {
         continue;
       sg->sign_phase = SPHASE_IN_SESSION;
       sg->session_id = sess->id;
-      signer_send(sg, FROST_MSG_RELAY_COMMIT, spkg, (uint16_t)spkg_len);
+      signer_send(sg, FROST_MSG_RELAY_COMMIT, NULL, 0, spkg,
+                  (uint16_t)spkg_len);
       break;
     }
   }
@@ -1045,7 +1051,7 @@ static void roast_fail_culprit(struct signerlist *list,
       sg->commit_len = 0;
       sg->sig_share_len = 0;
       sg->session_id = 0;
-      signer_send(sg, FROST_MSG_SIGN_REQ, g_tbs, g_tbs_len);
+      signer_send(sg, FROST_MSG_SIGN_REQ, NULL, 0, g_tbs, g_tbs_len);
       printf("coordinator: [ROAST] signer %u reset (innocent)\n", sg->id);
       break;
     }
@@ -1164,7 +1170,7 @@ static void roast_try_aggregate(struct signerlist *list,
     LIST_FOREACH_SAFE(sg, list, entries, tmp)
     // signer_send(sg, FROST_MSG_CERT_OUTPUT, (uint8_t *)g_output_file,
     //            (uint16_t)strlen(g_output_file));
-    signer_send(sg, FROST_MSG_CERT_OUTPUT, NULL, 0);
+    signer_send(sg, FROST_MSG_CERT_OUTPUT, NULL, 0, NULL, 0);
     return;
   }
 
@@ -1273,7 +1279,7 @@ static void roast_expire_sessions(struct signerlist *list) {
           sg->commit_len = 0;
           sg->sig_share_len = 0;
           sg->session_id = 0;
-          signer_send(sg, FROST_MSG_SIGN_REQ, g_tbs, g_tbs_len);
+          signer_send(sg, FROST_MSG_SIGN_REQ, NULL, 0, g_tbs, g_tbs_len);
           printf("coordinator: [ROAST] signer %u → INIT  "
                  "(strikes=%d, reliable)\n",
                  sg->id, get_strikes(sg->id));
@@ -1293,7 +1299,7 @@ static void roast_expire_sessions(struct signerlist *list) {
             sg->commit_len = 0;
             sg->sig_share_len = 0;
             sg->session_id = 0;
-            signer_send(sg, FROST_MSG_SIGN_REQ, g_tbs, g_tbs_len);
+            signer_send(sg, FROST_MSG_SIGN_REQ, NULL, 0, g_tbs, g_tbs_len);
             printf("coordinator: [ROAST] signer %u → SUSPECT "
                    "(strike %d/%d)\n",
                    sg->id, strikes, FROST_MAX_STRIKES);
@@ -1318,7 +1324,8 @@ static void roast_expire_sessions(struct signerlist *list) {
  * ══════════════════════════════════════════════════════════════════ */
 
 static void process_signer_frame(struct signerlist *list, struct signer *sg,
-                                 frost_msg_t type, const uint8_t *payload,
+                                 frost_msg_t type, const uint8_t *sig,
+                                 uint16_t slen, const uint8_t *payload,
                                  uint16_t plen) {
   switch (type) {
 
@@ -1329,6 +1336,7 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
       return;
     if (plen > FROST_MAX_PAYLOAD)
       return;
+    memcpy(sg->r1_sig, sig, slen);
     memcpy(sg->r1_pkg, payload, plen);
     sg->r1_len = plen;
     printf("coordinator: r1 from signer %u (%u bytes)\n", sg->id, plen);
@@ -1343,7 +1351,7 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
     printf("[%s:%d] hex = ", __FILE__, __LINE__);
     print_bytes_as_hex(payload, plen);
 
-    relay_r2_to_target(list, target, payload, plen);
+    relay_r2_to_target(list, target, sig, slen, payload, plen);
     break;
   }
 
@@ -1360,6 +1368,7 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
       return;
     if (plen > FROST_MAX_PAYLOAD)
       return;
+    memcpy(sg->r1_sig, sig, slen);
     memcpy(sg->r1_pkg, payload, plen);
     sg->r1_len = plen;
     printf("coordinator: [REFRESH] r1 from signer %u (%u bytes)\n", sg->id,
@@ -1381,7 +1390,7 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
     struct signer *tsg, *ttmp;
     LIST_FOREACH_SAFE(tsg, list, entries, ttmp)
     if (tsg->id == target) {
-      signer_send(tsg, FROST_MSG_RELAY_REFRESH_R2, payload, plen);
+      signer_send(tsg, FROST_MSG_RELAY_REFRESH_R2, sig, slen, payload, plen);
       break;
     }
     break;
@@ -1762,6 +1771,24 @@ int main(int argc, char **argv) {
       }
     }
 
+    if (g_dkg_state == DKG_COMPLETE &&
+        (g_mode == COORD_MODE_DKG || g_mode == COORD_MODE_REFRESH)) {
+      int all_quiet = 1;
+      struct signer *sg, *tmp;
+      LIST_FOREACH_SAFE(sg, &signers, entries, tmp) {
+        if (!TAILQ_EMPTY(&sg->msgq)) {
+          all_quiet = 0;
+          break;
+        }
+      }
+      if (all_quiet) {
+        LIST_FOREACH_SAFE(sg, &signers, entries, tmp) {
+          remove_signer(&signers, sg);
+        }
+        break;
+      }
+    }
+
     fd_set readset, writeset;
     int max_fd;
     FD_ZERO(&readset);
@@ -1878,8 +1905,11 @@ int main(int argc, char **argv) {
       if ((st->inptr - st->inbuf) < FROST_FRAME_HDR)
         continue;
       frost_msg_t msg_type;
-      uint16_t plen = frost_decode_header(st->inbuf, &msg_type);
-      if ((st->inptr - st->inbuf) < (int)(FROST_FRAME_HDR + plen))
+
+      gnutls_datum_t sig; // ENSURE FREE
+      uint16_t plen = frost_decode_header(st->inbuf, &msg_type, &sig);
+      if ((st->inptr - st->inbuf) <
+          (int)(FROST_FRAME_HDR + FROST_FRAME_SIG_SIZE + plen))
         continue;
       st->inptr = st->inbuf;
 
@@ -1897,7 +1927,7 @@ int main(int argc, char **argv) {
       char hellobuf[64];
       uint16_t pid = 0, pn = 0, pt = 0;
       size_t cp = plen < 63 ? plen : 63;
-      memcpy(hellobuf, st->inbuf + FROST_FRAME_HDR, cp);
+      memcpy(hellobuf, st->inbuf + FROST_FRAME_HDR + FROST_FRAME_SIG_SIZE, cp);
       hellobuf[cp] = '\0';
       if (sscanf(hellobuf, "SIGNER %hu %hu %hu", &pid, &pn, &pt) != 3 ||
           pid < 1 || pid > FROST_MAX_SIGNERS || pn < 2 || pt < 1 || pt > pn ||
@@ -1985,7 +2015,7 @@ int main(int argc, char **argv) {
                             g_mode == COORD_MODE_DKG    ? 'D'
                             : g_mode == COORD_MODE_SIGN ? 'S'
                                                         : 'R');
-      signer_send(new_sg, FROST_MSG_HELLO_ACK, (uint8_t *)ackbuf,
+      signer_send(new_sg, FROST_MSG_HELLO_ACK, NULL, 0, (uint8_t *)ackbuf,
                   (uint16_t)acklen);
 
       /* Mode-specific actions */
@@ -1997,7 +2027,7 @@ int main(int argc, char **argv) {
         /* SIGN mode: send SIGN_REQ immediately.
          * The signer processes HELLO_ACK first (sets its ID, loads key from
          * disk), then processes SIGN_REQ in the next select iteration.     */
-        signer_send(new_sg, FROST_MSG_SIGN_REQ, g_tbs, g_tbs_len);
+        signer_send(new_sg, FROST_MSG_SIGN_REQ, NULL, 0, g_tbs, g_tbs_len);
         printf("coordinator: [ROAST] SIGN_REQ → signer %u\n", new_sg->id);
       }
     } /* staged loop */
@@ -2027,11 +2057,14 @@ int main(int argc, char **argv) {
       if ((sg->inptr - sg->inbuf) < FROST_FRAME_HDR)
         continue;
       frost_msg_t msg_type;
-      uint16_t plen = frost_decode_header(sg->inbuf, &msg_type);
-      if ((sg->inptr - sg->inbuf) < (int)(FROST_FRAME_HDR + plen))
+      gnutls_datum_t sig;
+      uint16_t plen = frost_decode_header(sg->inbuf, &msg_type, &sig);
+      if ((sg->inptr - sg->inbuf) <
+          (int)(FROST_FRAME_HDR + FROST_FRAME_SIG_SIZE + plen))
         continue;
       sg->inptr = sg->inbuf;
-      process_signer_frame(&signers, sg, msg_type, sg->inbuf + FROST_FRAME_HDR,
+      process_signer_frame(&signers, sg, msg_type, sig.data, sig.size,
+                           sg->inbuf + FROST_FRAME_HDR + FROST_FRAME_SIG_SIZE,
                            plen);
     } /* signer loop */
 
