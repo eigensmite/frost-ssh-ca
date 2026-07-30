@@ -12,8 +12,7 @@
 //!
 //!   dkg_part2  --id <u16> --n <u16> --t <u16>
 //!     stdin:  line 1     — hex(round1::SecretPackage)
-//!             line 2     — "<sender_id> <hex(round1::Package)>"  × (n-1)
-//!     stdout: line 1     — hex(round2::SecretPackage)
+//!             line 2     — "<sender_id> <hex(// TODO   stdout: line 1     — hex(round2::SecretPackage)
 //!             lines 2..n — "<target_id> <hex(round2::Package)>"  × (n-1)
 //!
 //!   dkg_part3  --id <u16> --n <u16> --t <u16>

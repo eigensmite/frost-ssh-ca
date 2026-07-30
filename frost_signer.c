@@ -125,6 +125,7 @@ static uint8_t *g_inptr;
 static int g_want_write = 0;
 
 gnutls_privkey_t my_priv;
+gnutls_privkey_t my_priv_oaep;
 
 TAILQ_HEAD(outq_head, outmsg) g_outq;
 
@@ -434,8 +435,7 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
                            .size = plen - 2};
 
     if (gnutls_pubkey_verify_data2(sender_pubkey, GNUTLS_SIGN_RSA_SHA256, 0,
-                                   &data,
-                                   &sig) == GNUTLS_E_PK_SIG_VERIFY_FAILED) {
+                                   &data, &sig) < 0) {
       fprintf(stderr, "signer %u: r1 package verification failed\n", g_my_id);
       return;
     }
@@ -475,7 +475,7 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
      * payload = [src_id_hi][src_id_lo][dst_id_hi][dst_id_lo][pkg bytes] */
     for (int i = 0; i < g_peer_r1_count; i++) {
 
-      gnutls_pubkey_t pub = get_signer_pubkey(r2_ids[i]);
+      gnutls_pubkey_t pub = get_signer_pubkey_oaep(r2_ids[i]);
       if (!pub) {
         fprintf(stderr, "signer %u: no pubkey for signer %u, skipping\n",
                 g_my_id, r2_ids[i]);
@@ -540,8 +540,7 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
     gnutls_datum_t data = {.data = (unsigned char *)&payload[0], .size = plen};
 
     if (gnutls_pubkey_verify_data2(sender_pubkey, GNUTLS_SIGN_RSA_SHA256, 0,
-                                   &data,
-                                   &sig) == GNUTLS_E_PK_SIG_VERIFY_FAILED) {
+                                   &data, &sig) < 0) {
       fprintf(stderr, "signer %u: r2 package verification failed\n", g_my_id);
       return;
     }
@@ -557,7 +556,8 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
     gnutls_datum_t plaintext;
 
     check_in(CP_R2_DECRYPT);
-    int rc = gnutls_privkey_decrypt_data(my_priv, 0, &ciphertext, &plaintext);
+    int rc =
+        gnutls_privkey_decrypt_data(my_priv_oaep, 0, &ciphertext, &plaintext);
     check_out(CP_R2_DECRYPT);
     if (rc < 0) {
       fprintf(stderr, "signer %u: decrypt failed: %s\n", g_my_id,
@@ -687,8 +687,7 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
                            .size = plen - 2};
 
     if (gnutls_pubkey_verify_data2(sender_pubkey, GNUTLS_SIGN_RSA_SHA256, 0,
-                                   &data,
-                                   &sig) == GNUTLS_E_PK_SIG_VERIFY_FAILED) {
+                                   &data, &sig) < 0) {
       fprintf(stderr, "signer %u: r1 package verification failed\n", g_my_id);
       return;
     }
@@ -791,8 +790,7 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
     gnutls_datum_t data = {.data = (unsigned char *)&payload[0], .size = plen};
 
     if (gnutls_pubkey_verify_data2(sender_pubkey, GNUTLS_SIGN_RSA_SHA256, 0,
-                                   &data,
-                                   &sig) == GNUTLS_E_PK_SIG_VERIFY_FAILED) {
+                                   &data, &sig) < 0) {
       fprintf(stderr, "signer %u: r2 package verification failed\n", g_my_id);
       return;
     }
@@ -808,7 +806,8 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
     gnutls_datum_t plaintext;
 
     check_in(CP_R2_DECRYPT);
-    int rc = gnutls_privkey_decrypt_data(my_priv, 0, &ciphertext, &plaintext);
+    int rc =
+        gnutls_privkey_decrypt_data(my_priv_oaep, 0, &ciphertext, &plaintext);
     check_out(CP_R2_DECRYPT);
     if (rc < 0) {
       fprintf(stderr, "signer %u: decrypt failed: %s\n", g_my_id,
@@ -1089,6 +1088,11 @@ int main(int argc, char **argv) {
   snprintf(expected_cert, sizeof(expected_cert), "certs/signer%u.crt", g_my_id);
   snprintf(expected_key, sizeof(expected_key), "certs/signer%ukey.pem",
            g_my_id);
+  char expected_cert_oaep[64], expected_key_oaep[64];
+  snprintf(expected_cert_oaep, sizeof(expected_cert_oaep),
+           "certs/signer%u_oaep.crt", g_my_id);
+  snprintf(expected_key_oaep, sizeof(expected_key_oaep),
+           "certs/signer%ukey_oaep.pem", g_my_id);
 
   {
 
@@ -1107,6 +1111,27 @@ int main(int argc, char **argv) {
               "to start (this signer's own decryption key must live "
               "there)\n",
               g_my_id, expected_key);
+      return EXIT_FAILURE;
+    }
+  }
+
+  {
+
+    struct stat st;
+    if (stat(expected_cert_oaep, &st) != 0) {
+      fprintf(stderr,
+              "signer: id %u asserted, but '%s' does not exist — refusing "
+              "to start (peers would encrypt to this signer using that "
+              "file)\n",
+              g_my_id, expected_cert_oaep);
+      return EXIT_FAILURE;
+    }
+    if (stat(expected_key_oaep, &st) != 0) {
+      fprintf(stderr,
+              "signer: id %u asserted, but '%s' does not exist — refusing "
+              "to start (this signer's own decryption key must live "
+              "there)\n",
+              g_my_id, expected_key_oaep);
       return EXIT_FAILURE;
     }
   }
@@ -1151,11 +1176,19 @@ int main(int argc, char **argv) {
    * just a file that happens to sit at that path. Without this, a
    * signer could assert an ID it doesn't hold the matching private
    * key for and still pass the earlier existence check.              */
-  if (verify_own_identity(g_my_id, expected_cert) != 0) {
+  if (verify_own_identity(g_my_id, expected_cert, get_signer_pubkey(g_my_id)) !=
+      0) {
     return EXIT_FAILURE;
   }
   printf("signer: identity verified — '%s' matches certs/signer%u.crt\n",
          expected_cert, g_my_id);
+
+  if (verify_own_identity(g_my_id, expected_cert_oaep,
+                          get_signer_pubkey_oaep(g_my_id)) != 0) {
+    return EXIT_FAILURE;
+  }
+  printf("signer: identity verified — '%s' matches certs/signer%u.crt\n",
+         expected_cert_oaep, g_my_id);
 
   /* GnuTLS setup */
   gnutls_certificate_credentials_t x509_cred;
@@ -1172,13 +1205,26 @@ int main(int argc, char **argv) {
 
   /* Extract tls private key for routed payload decryption */
   gnutls_privkey_init(&my_priv);
-
   gnutls_datum_t key_data;
   gnutls_load_file(expected_key,
                    &key_data); /* e.g. certs/signer{g_my_id}key.pem */
   gnutls_privkey_import_x509_raw(my_priv, &key_data, GNUTLS_X509_FMT_PEM, NULL,
                                  0);
   gnutls_free(key_data.data);
+
+  gnutls_privkey_init(&my_priv_oaep);
+  gnutls_datum_t key_oaep_data;
+  gnutls_load_file(expected_key_oaep, &key_oaep_data);
+  gnutls_privkey_import_x509_raw(my_priv_oaep, &key_oaep_data,
+                                 GNUTLS_X509_FMT_PEM, NULL, 0);
+  gnutls_free(key_oaep_data.data);
+
+  /* Configure priv key and pub key cache to use
+   * RSA-OAEP instead of RSAES-PKCS1-v1_5 */
+  if (config_gnutls_keys_for_RSA_OAEP(&my_priv_oaep)) {
+    perror("failed configure for RSA-OAEP\n");
+    return EXIT_FAILURE;
+  }
 
   g_coord_sock = connect_to_coordinator(x509_cred);
   if (g_coord_sock < 0)

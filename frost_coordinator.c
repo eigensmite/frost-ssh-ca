@@ -80,6 +80,8 @@ struct signer {
   /* Sign-mode per-signer state */
   uint8_t commit[FROST_MAX_PAYLOAD];
   uint16_t commit_len;
+  uint8_t commit_sig[FROST_FRAME_SIG_SIZE];
+  uint16_t commit_sig_len;
   uint8_t sig_share[FROST_MAX_PAYLOAD];
   uint16_t sig_share_len;
   sphase_t sign_phase;
@@ -1480,9 +1482,12 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
     memcpy(sg->commit, payload, plen);
     sg->commit_len = plen;
     sg->sign_phase = SPHASE_COMMITTED;
+
+    memcpy(sg->commit_sig, sig, slen);
+    sg->commit_sig_len = slen;
+
     printf("coordinator: [ROAST] commit from signer %u (%u bytes)\n", sg->id,
            plen);
-
     /* Try to form a session whenever a new commit lands */
     if (!g_signing_done && roast_active_count() < ROAST_MAX_SESSIONS)
       roast_try_form_session(list);
@@ -1989,6 +1994,7 @@ int main(int argc, char **argv) {
       new_sg->r1_len = 0;
       new_sg->r2_complete = 0;
       new_sg->commit_len = 0;
+      new_sg->commit_sig_len = 0;
       new_sg->sig_share_len = 0;
       new_sg->sign_phase = SPHASE_INIT;
       new_sg->session_id = 0;
