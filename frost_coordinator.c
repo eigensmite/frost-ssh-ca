@@ -55,6 +55,9 @@
 #include "frost_common.h"
 #include "frost_stubs.c" /* bytes_to_hex, hex_to_bytes, popen_multi, … */
 
+static uint32_t g_tracking_bytes_sent[FROST_MAX_SIGNERS + 1] = {0};
+static uint32_t g_tracking_bytes_rcvd[FROST_MAX_SIGNERS + 1] = {0};
+
 /* ══════════════════════════════════════════════════════════════════
  * Per-connection data structures
  * ══════════════════════════════════════════════════════════════════ */
@@ -77,11 +80,17 @@ struct signer {
   uint16_t r1_len;
   int r2_complete;
 
+  /* DKG pub key buffers */
+  uint8_t pub_key_pkg[FROST_MAX_PAYLOAD];
+  uint16_t pub_key_len;
+
   /* Sign-mode per-signer state */
   uint8_t commit[FROST_MAX_PAYLOAD];
   uint16_t commit_len;
-  uint8_t commit_sig[FROST_FRAME_SIG_SIZE];
-  uint16_t commit_sig_len;
+  uint8_t commit_sig[FROST_FRAME_SIG_SIZE]; /* sig over `commit`, from the
+                                             * signer's own key -- relayed
+                                             * in the RELAY_COMMIT bundle so
+                                             * recipients can verify it. */
   uint8_t sig_share[FROST_MAX_PAYLOAD];
   uint16_t sig_share_len;
   sphase_t sign_phase;
@@ -547,6 +556,7 @@ static void drain_signer_write(struct signer *sg, struct signerlist *list) {
   }
   sg->want_write = 0;
   m->sent += (size_t)r;
+  g_tracking_bytes_sent[sg->id] += (uint32_t)r; // TRACKING calc all bytes sent
   if (m->sent >= m->len) {
     TAILQ_REMOVE(&sg->msgq, m, entries);
     free(m->data);
@@ -572,6 +582,7 @@ static void drain_staged_write(struct staged_conn *st,
   }
   st->want_write = 0;
   m->sent += (size_t)r;
+  g_tracking_bytes_sent[0] += (uint32_t)r; // TRACKING calc all bytes sent
   if (m->sent >= m->len) {
     TAILQ_REMOVE(&st->msgq, m, entries);
     free(m->data);
@@ -913,71 +924,76 @@ static int roast_try_form_session(struct signerlist *list) {
          /* count how many of the chosen have zero strikes */
          (r), (s2));
 
-  /* Build stdin for frost_signer_core assemble:
-   *   line 1: hex(TBS)
-   *   line 2: t
-   *   lines 3..t+2: "<id> <hex(commit)>"
-   */
-  char assemble_in[FROST_MAX_PAYLOAD * FROST_MAX_SIGNERS * 3];
-  size_t off = 0;
-  off += (size_t)snprintf(assemble_in + off, sizeof(assemble_in) - off,
-                          "%s\n%u\n", g_tbs_hex, (unsigned)g_t);
+  /* ── Build the authenticated commit bundle ─────────────────────
+   * Every chosen signer's own RSA-signed commitment, plus the
+   * canonical tbs. This is what gets relayed to every signer in the
+   * session -- identical for all recipients -- and each one verifies
+   * it independently before deriving its own spkg (see below and
+   * FROST_MSG_RELAY_COMMIT in frost_signer.c). Deliberately no spkg
+   * lives in this struct; see the comment on struct frost_commit_bundle
+   * in frost_common.h for why. */
+  static struct frost_commit_bundle bundle;
+  memset(&bundle, 0, sizeof(bundle));
+  bundle.n_entries = (uint16_t)n_chosen;
   for (int ci = 0; ci < n_chosen; ci++) {
     LIST_FOREACH_SAFE(sg, list, entries, tmp) {
       if (sg->id != chosen[ci])
         continue;
-      char commit_hex[FROST_MAX_PAYLOAD * 2 + 2];
-      bytes_to_hex(sg->commit, sg->commit_len, commit_hex);
-      off += (size_t)snprintf(assemble_in + off, sizeof(assemble_in) - off,
-                              "%u %s\n", (unsigned)sg->id, commit_hex);
+      if (sg->commit_len > FROST_COMMIT_ENTRY_MAX) {
+        fprintf(stderr,
+                "coordinator: [ROAST] commit from signer %u too large for "
+                "bundle (%u > %d)\n",
+                sg->id, sg->commit_len, FROST_COMMIT_ENTRY_MAX);
+        return 0;
+      }
+      bundle.entries[ci].id = sg->id;
+      bundle.entries[ci].commit_len = sg->commit_len;
+      memcpy(bundle.entries[ci].commit, sg->commit, sg->commit_len);
+      memcpy(bundle.entries[ci].commit_sig, sg->commit_sig,
+             FROST_FRAME_SIG_SIZE);
       break;
     }
   }
-
-  check_in(CP_TEMPFILE_WRITE);
-  char tmpfile[] = "/tmp/frost_assemble_XXXXXX";
-  int tmpfd = mkstemp(tmpfile);
-  if (tmpfd < 0) {
-    perror("mkstemp assemble");
-    check_out(CP_TEMPFILE_WRITE);
+  if (g_tbs_len > FROST_MAX_PAYLOAD) {
+    fprintf(stderr, "coordinator: [ROAST] tbs too large for bundle\n");
     return 0;
   }
-  write(tmpfd, assemble_in, off);
-  close(tmpfd);
-  check_out(CP_TEMPFILE_WRITE);
+  bundle.tbs_len = (uint16_t)g_tbs_len;
+  memcpy(bundle.tbs, g_tbs, g_tbs_len);
 
-  char cmd[256];
-  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " assemble < %s", tmpfile);
-  check_in(CP_ASSEMBLE_BASH);
-  FILE *fp = popen(cmd, "r");
-  if (!fp) {
-    perror("popen assemble");
-    unlink(tmpfile);
-    check_out(CP_ASSEMBLE_BASH);
-    return 0;
-  }
-
-  char spkg_hex[FROST_MAX_PAYLOAD * 2 + 4];
-  if (!fgets(spkg_hex, sizeof(spkg_hex), fp)) {
-    fprintf(stderr, "coordinator: [ROAST] assemble produced no output\n");
-    pclose(fp);
-    unlink(tmpfile);
-    check_out(CP_ASSEMBLE_BASH);
-    return 0;
-  }
-  int exit_code = pclose(fp);
-  check_out(CP_ASSEMBLE_BASH);
-  unlink(tmpfile);
-  if (exit_code != 0) {
-    fprintf(stderr, "coordinator: [ROAST] assemble failed (exit %d)\n",
-            exit_code);
-    return 0;
-  }
-
+  /* The coordinator still needs its own spkg for the later aggregation
+   * step (sess->signing_pkg, used by roast_try_aggregate()). It derives
+   * this the exact same way every signer now will: by invoking
+   * `assemble` over the bundle it just built -- not by trusting a
+   * separately-built blob that could silently diverge from what was
+   * actually relayed. */
   uint8_t spkg[FROST_MAX_PAYLOAD];
-  int spkg_len = hex_to_bytes(spkg_hex, spkg, FROST_MAX_PAYLOAD);
-  if (spkg_len <= 0) {
-    fprintf(stderr, "coordinator: [ROAST] assemble hex decode failed\n");
+  uint16_t spkg_len16 = 0;
+  if (frost_assemble_signing_package(&bundle, spkg, &spkg_len16) != 0) {
+    fprintf(stderr,
+            "coordinator: [ROAST] failed to assemble signing package\n");
+    return 0;
+  }
+  int spkg_len = (int)spkg_len16;
+
+  static uint8_t bundle_wire[FROST_COMMIT_BUNDLE_WIRE_MAX];
+  int bundle_len =
+      frost_pack_commit_bundle(bundle_wire, sizeof(bundle_wire), &bundle);
+  if (bundle_len < 0) {
+    fprintf(stderr, "coordinator: [ROAST] failed to pack commit bundle\n");
+    return 0;
+  }
+  if (bundle_len > FROST_MAX_PAYLOAD) {
+    /* The frame layer silently drops payloads over FROST_MAX_PAYLOAD.
+     * With FROST_COMMIT_ENTRY_MAX=256 this comfortably covers small-to-
+     * medium t; deployments with larger t/n should raise FROST_MAX_PAYLOAD
+     * (and FROST_FRAME_MAX derives from it automatically) rather than let
+     * this fail silently in production. */
+    fprintf(stderr,
+            "coordinator: [ROAST] commit bundle (%d bytes) exceeds "
+            "FROST_MAX_PAYLOAD (%d) — increase FROST_MAX_PAYLOAD for this "
+            "t/n, aborting session\n",
+            bundle_len, FROST_MAX_PAYLOAD);
     return 0;
   }
 
@@ -1001,15 +1017,15 @@ static int roast_try_form_session(struct signerlist *list) {
         continue;
       sg->sign_phase = SPHASE_IN_SESSION;
       sg->session_id = sess->id;
-      signer_send(sg, FROST_MSG_RELAY_COMMIT, NULL, 0, spkg,
-                  (uint16_t)spkg_len);
+      signer_send(sg, FROST_MSG_RELAY_COMMIT, NULL, 0, bundle_wire,
+                  (uint16_t)bundle_len);
       break;
     }
   }
-  fprintf(stderr,
-          "BYTES msg=RELAY_COMMIT session=%u t=%d pkg_bytes=%d "
-          "recipients=%d total_bytes=%d\n",
-          sess->id, n_chosen, spkg_len, n_chosen, spkg_len * n_chosen);
+  // fprintf(stderr,
+  //         "BYTES msg=RELAY_COMMIT session=%u t=%d pkg_bytes=%d "
+  //         "recipients=%d total_bytes=%d\n",
+  //         sess->id, n_chosen, bundle_len, n_chosen, bundle_len * n_chosen);
 
   printf("coordinator: [ROAST] session %u formed — signers {", sess->id);
   for (int ci = 0; ci < n_chosen; ci++)
@@ -1407,6 +1423,44 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
     break;
 
   case FROST_MSG_REFRESH_COMPLETE:
+    fprintf(stdout, "[REFRESH] signer %u pub_key_pkg share saved\n", sg->id);
+    {
+      memcpy(sg->pub_key_pkg, payload, plen);
+      sg->pub_key_len = plen;
+      g_refresh_complete_count++;
+
+      if (g_refresh_complete_count < g_n)
+        break;
+
+      /* Ensure all signer pub key packages are identical */
+      struct signer *psg = NULL;
+      struct signer *tsg, *ttmp;
+      LIST_FOREACH_SAFE(tsg, list, entries, ttmp) {
+        if (psg == NULL) {
+          psg = tsg;
+          continue;
+        }
+        if (tsg->pub_key_len == 0) {
+          fprintf(stderr, "signer %u has pub_key_len of 0", tsg->id);
+          break;
+        }
+        if (psg->pub_key_len != tsg->pub_key_len) {
+          fprintf(stderr,
+                  "signer %u and signer %u have different pub_key_len\n",
+                  psg->id, tsg->id);
+          break;
+        }
+        if (memcmp(psg->pub_key_pkg, tsg->pub_key_pkg, psg->pub_key_len) != 0) {
+          fprintf(stderr,
+                  "signer %u and signer %u have different pub_key_pkg\n",
+                  psg->id, tsg->id);
+          break;
+        }
+        psg = tsg;
+      }
+      fprintf(stdout,
+              "All signer pub_key_pkgs verified... saving pub key file.\n");
+    }
     /* Payload = new PublicKeyPackage hex bytes (raw, not hex-encoded again) */
     if (g_pub_key_pkg_len == 0 && plen > 0) {
       /* Save updated pub_key_pkg from the first signer that reports */
@@ -1423,15 +1477,53 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
       }
       check_out(CP_PUBKEYPKG_WRITE);
     }
-    g_refresh_complete_count++;
     printf("coordinator: [REFRESH] signer %u confirmed new shares (%d/%u)\n",
            sg->id, g_refresh_complete_count, g_n);
     check_refresh_all_confirmed(list);
     break;
 
   case FROST_MSG_PUB_KEY_PKG:
-    if (g_pub_key_pkg_len > 0)
-      break; /* keep first one received */
+
+    fprintf(stdout, "[DKG] signer %u pub_key_pkg share saved\n", sg->id);
+    {
+      memcpy(sg->pub_key_pkg, payload, plen);
+      sg->pub_key_len = plen;
+      g_refresh_complete_count++;
+
+      if (g_refresh_complete_count < g_n)
+        break;
+
+      /* Ensure all signer pub key packages are identical */
+      struct signer *psg = NULL;
+      struct signer *tsg, *ttmp;
+      LIST_FOREACH_SAFE(tsg, list, entries, ttmp) {
+        if (psg == NULL) {
+          psg = tsg;
+          continue;
+        }
+        if (tsg->pub_key_len == 0) {
+          fprintf(stderr, "signer %u has pub_key_len of 0", tsg->id);
+          break;
+        }
+        if (psg->pub_key_len != tsg->pub_key_len) {
+          fprintf(stderr,
+                  "signer %u and signer %u have different pub_key_len\n",
+                  psg->id, tsg->id);
+          break;
+        }
+        if (memcmp(psg->pub_key_pkg, tsg->pub_key_pkg, psg->pub_key_len) != 0) {
+          fprintf(stderr,
+                  "signer %u and signer %u have different pub_key_pkg\n",
+                  psg->id, tsg->id);
+          break;
+        }
+        psg = tsg;
+      }
+      fprintf(stdout,
+              "All signer pub_key_pkgs verified... saving pub key file.\n");
+    }
+    // if (g_pub_key_pkg_len > 0)
+    //   break; /* keep first one received */
     if (plen > FROST_MAX_PAYLOAD)
       return;
     memcpy(g_pub_key_pkg, payload, plen);
@@ -1450,6 +1542,7 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
       }
       check_out(CP_PUBKEYPKG_WRITE);
     }
+    g_signing_done = 1;
     break;
 
     /* ── Sign-mode messages ───────────────────────────────────── */
@@ -1475,19 +1568,25 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
       break;
     }
 
-    if (plen > FROST_MAX_PAYLOAD) {
+    if (plen > FROST_MAX_PAYLOAD || plen > FROST_COMMIT_ENTRY_MAX) {
+      // check_out(CP_COMMIT_ROUTE);
+      return;
+    }
+    if (slen != FROST_FRAME_SIG_SIZE) {
+      fprintf(stderr,
+              "coordinator: commit from signer %u missing a valid signature "
+              "(slen=%u) — rejecting\n",
+              sg->id, slen);
       // check_out(CP_COMMIT_ROUTE);
       return;
     }
     memcpy(sg->commit, payload, plen);
     sg->commit_len = plen;
-    sg->sign_phase = SPHASE_COMMITTED;
-
     memcpy(sg->commit_sig, sig, slen);
-    sg->commit_sig_len = slen;
-
+    sg->sign_phase = SPHASE_COMMITTED;
     printf("coordinator: [ROAST] commit from signer %u (%u bytes)\n", sg->id,
            plen);
+
     /* Try to form a session whenever a new commit lands */
     if (!g_signing_done && roast_active_count() < ROAST_MAX_SESSIONS)
       roast_try_form_session(list);
@@ -1710,7 +1809,13 @@ int main(int argc, char **argv) {
 
   printf("coordinator: mode = %s\n", g_mode == COORD_MODE_DKG ? "DKG" : "SIGN");
 
-  /* GnuTLS */
+  /* GnuTLS — mutual TLS: the coordinator authenticates to signers with
+   * FROST_COORD_CERT/KEY as before, but now also REQUIRES and VERIFIES
+   * a client certificate from every connecting signer (see
+   * GNUTLS_CERT_REQUIRE + gnutls_session_set_verify_cert() below, at
+   * accept time). Both directions are checked against the same CA
+   * trust file, so a signer socket that can't present a cert this CA
+   * issued never gets past the handshake, let alone to HELLO.        */
   gnutls_certificate_credentials_t x509_cred;
   gnutls_global_init();
   gnutls_certificate_allocate_credentials(&x509_cred);
@@ -1776,7 +1881,7 @@ int main(int argc, char **argv) {
       }
     }
 
-    if (g_dkg_state == DKG_COMPLETE &&
+    if (g_dkg_state == DKG_COMPLETE && g_signing_done &&
         (g_mode == COORD_MODE_DKG || g_mode == COORD_MODE_REFRESH)) {
       int all_quiet = 1;
       struct signer *sg, *tmp;
@@ -1855,7 +1960,14 @@ int main(int argc, char **argv) {
       gnutls_session_t sess;
       gnutls_init(&sess, GNUTLS_SERVER);
       gnutls_credentials_set(sess, GNUTLS_CRD_CERTIFICATE, x509_cred);
-      gnutls_certificate_server_set_request(sess, GNUTLS_CERT_IGNORE);
+      /* mTLS: require a client certificate (handshake fails outright if
+       * none is presented) and verify it against FROST_CAFILE, exactly
+       * mirroring how the signer already verifies the coordinator's
+       * server certificate in connect_to_coordinator(). hostname=NULL
+       * because there's no hostname to match on the client side -- the
+       * chain-of-trust check is what matters here. */
+      gnutls_certificate_server_set_request(sess, GNUTLS_CERT_REQUIRE);
+      gnutls_session_set_verify_cert(sess, NULL, 0);
       gnutls_handshake_set_timeout(sess, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
       gnutls_priority_set_direct(sess, "NORMAL", NULL);
       gnutls_transport_set_int(sess, newsock);
@@ -1863,6 +1975,18 @@ int main(int argc, char **argv) {
       int r = gnutls_handshake(sess);
       check_out(CP_TLS_HANDSHAKE);
       if (r < 0) {
+        if (r == GNUTLS_E_CERTIFICATE_VERIFICATION_ERROR) {
+          gnutls_datum_t out;
+          unsigned status = gnutls_session_get_verify_cert_status(sess);
+          gnutls_certificate_verification_status_print(
+              status, GNUTLS_CRT_X509, &out, 0);
+          fprintf(stderr, "coordinator: client cert verify failure from %s: %s\n",
+                  inet_ntoa(cli.sin_addr), out.data);
+          gnutls_free(out.data);
+        } else {
+          fprintf(stderr, "coordinator: TLS handshake with %s failed: %s\n",
+                  inet_ntoa(cli.sin_addr), gnutls_strerror(r));
+        }
         gnutls_deinit(sess);
         close(newsock);
         goto accept_done;
@@ -1950,6 +2074,33 @@ int main(int argc, char **argv) {
         continue;
       }
 
+      /* mTLS identity binding: GNUTLS_CERT_REQUIRE + verify_cert (above)
+       * only proved this socket presented *some* certificate this CA
+       * issued. Now bind that authenticated TLS identity to the
+       * specific numeric id it's claiming in this HELLO -- without
+       * this, any signer's valid cert could be used to truthfully open
+       * an mTLS connection and then falsely claim a *different*
+       * signer's id at the application layer. */
+      if (ensure_signer_pubkey_cached(pid) != 0) {
+        char ebuf[64];
+        int elen = snprintf(ebuf, sizeof(ebuf),
+                            "no certs/signer%u.crt on coordinator", pid);
+        fprintf(stderr,
+                "coordinator: can't verify claimed id %u — %s\n", pid, ebuf);
+        staged_send(st, FROST_MSG_ERROR, (uint8_t *)ebuf, (uint16_t)elen);
+        continue;
+      }
+      if (verify_peer_tls_identity(st->session, pid) != 0) {
+        const uint8_t *e =
+            (const uint8_t *)"TLS certificate does not match claimed id";
+        fprintf(stderr,
+                "coordinator: signer at %s presented a cert that does not "
+                "match claimed id %u — rejecting\n",
+                inet_ntoa(st->addr.sin_addr), pid);
+        staged_send(st, FROST_MSG_ERROR, e, (uint16_t)strlen((char *)e));
+        continue;
+      }
+
       /* Reject if another already-registered signer holds this ID.
        * This is what actually prevents the connection-order race: two
        * signers can never end up sharing (or swapping) an identity —
@@ -1993,8 +2144,8 @@ int main(int argc, char **argv) {
       new_sg->want_write = 0;
       new_sg->r1_len = 0;
       new_sg->r2_complete = 0;
+      new_sg->pub_key_len = 0;
       new_sg->commit_len = 0;
-      new_sg->commit_sig_len = 0;
       new_sg->sig_share_len = 0;
       new_sg->sign_phase = SPHASE_INIT;
       new_sg->session_id = 0;
@@ -2060,6 +2211,7 @@ int main(int argc, char **argv) {
         continue;
       }
       sg->inptr += r;
+      g_tracking_bytes_rcvd[sg->id] = (uint32_t)r; // TRACKING all bytes rcvd
       if ((sg->inptr - sg->inbuf) < FROST_FRAME_HDR)
         continue;
       frost_msg_t msg_type;
@@ -2078,5 +2230,29 @@ int main(int argc, char **argv) {
 
   gnutls_global_deinit();
   close(listenfd);
+
+  { // TRACKING
+    uint64_t total_tracking_bytes_sent = 0;
+    uint64_t total_tracking_bytes_rcvd = 0;
+    printf("-----------------+---------------------+--------------------\n");
+    for (int i = 0; i < FROST_MAX_SIGNERS + 1; i++) {
+      if (i > 0 && g_tracking_bytes_sent[i] == 0 &&
+          g_tracking_bytes_rcvd[i] == 0) {
+        continue; // uninitialized/unused signer slot, skip
+      }
+
+      printf("Signer %2d %-6s | sent: %7u bytes | rcvd: %7u bytes\n", i,
+             (i == 0) ? "(stgd)" : "", g_tracking_bytes_sent[i],
+             g_tracking_bytes_rcvd[i]);
+
+      total_tracking_bytes_sent += (uint64_t)g_tracking_bytes_sent[i];
+      total_tracking_bytes_rcvd += (uint64_t)g_tracking_bytes_rcvd[i];
+    }
+    printf("-----------------+---------------------+--------------------\n");
+    printf("Total            | sent: %7lu bytes | rcvd: %7lu bytes\n",
+           total_tracking_bytes_sent, total_tracking_bytes_rcvd);
+    printf("-----------------+---------------------+--------------------\n");
+  } // TRACKING
+
   return EXIT_SUCCESS;
 }

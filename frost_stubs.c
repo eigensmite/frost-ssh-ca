@@ -688,6 +688,101 @@ static int frost_refresh_shares(
 }
 
 /* ═══════════════════════════════════════════════════════════════
+ * frost_assemble_signing_package
+ * ═══════════════════════════════════════════════════════════════
+ * Invokes `frost_signer_core assemble` -- the exact same subcommand
+ * the coordinator has always used to build a FROST SigningPackage --
+ * from a caller-supplied (tbs, {id, commit}) list.
+ *
+ * This is shared code so that BOTH the coordinator and every signer
+ * derive spkg the same way, from the same inputs. It is deliberately
+ * NOT relayed as data on the wire: an spkg is only as trustworthy as
+ * the (id, commit) pairs that went into it, and those already travel
+ * authenticated (RSA-signed per signer) inside struct frost_commit_bundle.
+ * A signer calls this only *after* verifying every entry in the bundle
+ * (see FROST_MSG_RELAY_COMMIT in frost_signer.c), so its locally-derived
+ * spkg is guaranteed to reflect nothing but commitments it just checked
+ * -- assemble is a pure function of its declared inputs, so there is no
+ * opportunity for the coordinator to smuggle in a mismatched package.
+ *
+ * Returns 0 on success (out_spkg/out_spkg_len populated), -1 on failure.
+ */
+static int frost_assemble_signing_package(const struct frost_commit_bundle *b,
+                                          uint8_t *out_spkg,
+                                          uint16_t *out_spkg_len) {
+  char tbs_hex[FROST_MAX_PAYLOAD * 2 + 2];
+  bytes_to_hex(b->tbs, b->tbs_len, tbs_hex);
+
+  char assemble_in[FROST_MAX_SIGNERS * (FROST_COMMIT_ENTRY_MAX * 2 + 16) +
+                   FROST_MAX_PAYLOAD * 2 + 32];
+  size_t off = 0;
+  off += (size_t)snprintf(assemble_in + off, sizeof(assemble_in) - off,
+                          "%s\n%u\n", tbs_hex, (unsigned)b->n_entries);
+  for (int i = 0; i < b->n_entries; i++) {
+    char commit_hex[FROST_COMMIT_ENTRY_MAX * 2 + 2];
+    bytes_to_hex(b->entries[i].commit, b->entries[i].commit_len, commit_hex);
+    off += (size_t)snprintf(assemble_in + off, sizeof(assemble_in) - off,
+                            "%u %s\n", (unsigned)b->entries[i].id, commit_hex);
+  }
+
+  check_in(CP_TEMPFILE_WRITE);
+  char tmpfile[] = "/tmp/frost_assemble_XXXXXX";
+  int tmpfd = mkstemp(tmpfile);
+  if (tmpfd < 0) {
+    perror("mkstemp assemble");
+    check_out(CP_TEMPFILE_WRITE);
+    return -1;
+  }
+  if (write(tmpfd, assemble_in, off) < 0) {
+    perror("write assemble tmpfile");
+    close(tmpfd);
+    unlink(tmpfile);
+    check_out(CP_TEMPFILE_WRITE);
+    return -1;
+  }
+  close(tmpfd);
+  check_out(CP_TEMPFILE_WRITE);
+
+  char cmd[300];
+  snprintf(cmd, sizeof(cmd), FROST_CORE_BIN " assemble < %s", tmpfile);
+  check_in(CP_ASSEMBLE_BASH);
+  FILE *fp = popen(cmd, "r");
+  if (!fp) {
+    perror("popen assemble");
+    unlink(tmpfile);
+    check_out(CP_ASSEMBLE_BASH);
+    return -1;
+  }
+
+  char spkg_hex[FROST_MAX_PAYLOAD * 2 + 4];
+  if (!fgets(spkg_hex, sizeof(spkg_hex), fp)) {
+    fprintf(stderr,
+            "frost_assemble_signing_package: assemble produced no output\n");
+    pclose(fp);
+    unlink(tmpfile);
+    check_out(CP_ASSEMBLE_BASH);
+    return -1;
+  }
+  int exit_code = pclose(fp);
+  check_out(CP_ASSEMBLE_BASH);
+  unlink(tmpfile);
+  if (exit_code != 0) {
+    fprintf(stderr,
+            "frost_assemble_signing_package: assemble failed (exit %d)\n",
+            exit_code);
+    return -1;
+  }
+
+  int spkg_len = hex_to_bytes(spkg_hex, out_spkg, FROST_MAX_PAYLOAD);
+  if (spkg_len <= 0) {
+    fprintf(stderr, "frost_assemble_signing_package: hex decode failed\n");
+    return -1;
+  }
+  *out_spkg_len = (uint16_t)spkg_len;
+  return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════
  * frost_commit
  * ═══════════════════════════════════════════════════════════════ */
 static int frost_commit(uint16_t my_id, const uint8_t *key_pkg,
@@ -843,6 +938,21 @@ static int load_signer_pubkey(uint16_t id) {
   return 0;
 }
 
+/* Load-on-demand variant of load_signer_pubkey(): a no-op if `id` is
+ * already cached, otherwise loads certs/signer<id>.crt (+ _oaep) just
+ * for that one id. Used by the coordinator, which -- unlike a signer --
+ * doesn't know in advance which ids will ever connect, so eagerly
+ * preloading all FROST_MAX_SIGNERS slots via init_signer_pubkey_cache()
+ * would fail on any deployment smaller than the compiled-in max.
+ * Returns 0 if cached (already or just-now), -1 on failure.           */
+static int ensure_signer_pubkey_cached(uint16_t id) {
+  if (id < 1 || id > FROST_MAX_SIGNERS)
+    return -1;
+  if (g_pubkey_cache[id] != NULL)
+    return 0;
+  return load_signer_pubkey(id);
+}
+
 /* Preload all signer public keys (1..FROST_MAX_SIGNERS) into the cache.
  * Call once during signer initialization, before the DKG ceremony starts.
  * Returns 0 if all loaded successfully, -1 if any failed. */
@@ -992,5 +1102,113 @@ out:
   gnutls_free(expected_der.data);
   gnutls_pubkey_deinit(supplied_pub);
   check_out(CP_VERIFY_IDENTITY);
+  return rc;
+}
+
+/* ══════════════════════════════════════════════════════════════════
+ * mTLS peer-identity binding
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * Requiring + verifying a client certificate at the TLS layer (see
+ * GNUTLS_CERT_REQUIRE + gnutls_session_set_verify_cert() in the
+ * coordinator's accept path) only proves "the peer holds some
+ * certificate this CA issued". It does NOT prove the peer is the
+ * specific signer id it is about to assert in its HELLO ("SIGNER
+ * <id> <n> <t>") -- any holder of a validly-issued cert could still
+ * claim someone else's numeric id at the application layer.
+ *
+ * This closes that gap the same way verify_own_identity() closes the
+ * analogous gap on the signer's own startup: pull the certificate the
+ * peer actually presented during the handshake, extract its
+ * SubjectPublicKeyInfo, and compare it (as DER) against the cached
+ * certs/signer<id>.crt pubkey for the id being claimed. A mismatch
+ * means "the socket in front of me is not signer <id>", regardless of
+ * whether its cert chains to a trusted CA.
+ *
+ * Must be called only after a successful, already-verified TLS
+ * handshake (i.e. after gnutls_handshake() returns >= 0 with
+ * verify_cert enabled) so `sess` really has a validated peer chain to
+ * pull from. Returns 0 on match, -1 on any mismatch or error (a
+ * diagnostic is printed in every failure case).                      */
+static int verify_peer_tls_identity(gnutls_session_t sess,
+                                    uint16_t claimed_id) {
+  if (gnutls_certificate_type_get(sess) != GNUTLS_CRT_X509) {
+    fprintf(stderr, "tls-identity: peer certificate is not X.509\n");
+    return -1;
+  }
+
+  unsigned int cert_list_size = 0;
+  const gnutls_datum_t *cert_list =
+      gnutls_certificate_get_peers(sess, &cert_list_size);
+  if (!cert_list || cert_list_size == 0) {
+    fprintf(stderr,
+            "tls-identity: no peer certificate on session (was a client "
+            "cert actually presented?)\n");
+    return -1;
+  }
+
+  gnutls_x509_crt_t peer_cert;
+  gnutls_x509_crt_init(&peer_cert);
+  if (gnutls_x509_crt_import(peer_cert, &cert_list[0], GNUTLS_X509_FMT_DER) !=
+      GNUTLS_E_SUCCESS) {
+    fprintf(stderr, "tls-identity: failed to parse peer leaf certificate\n");
+    gnutls_x509_crt_deinit(peer_cert);
+    return -1;
+  }
+
+  gnutls_pubkey_t peer_pub;
+  gnutls_pubkey_init(&peer_pub);
+  if (gnutls_pubkey_import_x509(peer_pub, peer_cert, 0) != GNUTLS_E_SUCCESS) {
+    fprintf(stderr, "tls-identity: failed to extract peer pubkey\n");
+    gnutls_x509_crt_deinit(peer_cert);
+    gnutls_pubkey_deinit(peer_pub);
+    return -1;
+  }
+  gnutls_x509_crt_deinit(peer_cert);
+
+  gnutls_pubkey_t expected_pub = get_signer_pubkey(claimed_id);
+  if (!expected_pub) {
+    /* get_signer_pubkey() already printed a diagnostic */
+    gnutls_pubkey_deinit(peer_pub);
+    return -1;
+  }
+
+  gnutls_datum_t peer_der = {0};
+  gnutls_datum_t expected_der = {0};
+  int rc = -1;
+
+  if (gnutls_pubkey_export2(peer_pub, GNUTLS_X509_FMT_DER, &peer_der) !=
+          GNUTLS_E_SUCCESS ||
+      gnutls_pubkey_export2(expected_pub, GNUTLS_X509_FMT_DER, &expected_der) !=
+          GNUTLS_E_SUCCESS) {
+    fprintf(stderr, "tls-identity: failed to export a public key for "
+                    "comparison\n");
+    goto out;
+  }
+
+  if (peer_der.size == expected_der.size &&
+      memcmp(peer_der.data, expected_der.data, peer_der.size) == 0) {
+    rc = 0;
+  } else {
+    fprintf(stderr,
+            "tls-identity: peer's TLS certificate does NOT match "
+            "certs/signer%u.crt — refusing to let this connection claim "
+            "id %u\n",
+            claimed_id, claimed_id);
+    rc = -1;
+    goto out;
+  }
+
+  // fprintf(stdout, "presented cert: ");
+  // print_bytes_as_hex(peer_der.data, peer_der.size);
+  // fprintf(
+  //     stdout,
+  //     "verified signer %u's presented cert against cached cert -- SUCCESS\n",
+  //     claimed_id);
+
+out:
+  gnutls_free(peer_der.data);
+  gnutls_free(expected_der.data);
+  gnutls_pubkey_deinit(peer_pub);
   return rc;
 }

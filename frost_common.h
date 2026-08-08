@@ -44,12 +44,12 @@
 #define TLS_RSA_KEY_BIT_LEN 2048
 
 /* ── Frame sizing ─────────────────────────────────────────────── */
-#define FROST_MAX_PAYLOAD 8192
+#define FROST_MAX_PAYLOAD 24000
 #define FROST_FRAME_HDR 5
 #define FROST_FRAME_SIG_SIZE (TLS_RSA_KEY_BIT_LEN / 8)
 #define FROST_FRAME_MAX                                                        \
   (FROST_FRAME_HDR + FROST_FRAME_SIG_SIZE + FROST_MAX_PAYLOAD)
-#define FROST_MAX_SIGNERS 96
+#define FROST_MAX_SIGNERS 64
 
 /* ── TLS certificate paths ────────────────────────────────────── */
 #define FROST_CAFILE "certs/rootCA.crt"
@@ -309,6 +309,169 @@ static inline uint16_t frost_decode_header(const uint8_t *buf,
       }                                                                        \
     }                                                                          \
   } while (0)
+
+/* ══════════════════════════════════════════════════════════════════
+ * Authenticated commit bundle — TS-UF-4 signing-phase relay
+ * ══════════════════════════════════════════════════════════════════
+ *
+ * Problem this closes: FROST_MSG_RELAY_COMMIT used to carry only the
+ * coordinator-assembled FROST SigningPackage (spkg), with no signature
+ * and no way for a signer to check that (a) every commitment in it was
+ * actually produced by the signer it's attributed to, (b) its own
+ * commitment wasn't substituted, or (c) the message being signed is
+ * the one it was actually asked about in SIGN_REQ. A corrupt/unauthenticated
+ * coordinator could hand different, inconsistent, or fabricated views to
+ * different signers -- see the RSA/ROS-style forgery this enables.
+ *
+ * Fix: relay each contributing signer's own RSA-signed commit (id,
+ * commit bytes, signer's signature over those bytes -- the same
+ * signature already produced by queue_to_coord() when FROST_MSG_COMMIT
+ * was sent) alongside the canonical tbs. Every signer in the session
+ * verifies the whole bundle before calling frost_sign(), exactly
+ * mirroring the existing RELAY_R1 / RELAY_R2 pattern where a forwarded
+ * package is checked against its *original sender's* pubkey rather than
+ * trusted because the coordinator sent it.
+ *
+ * The bundle deliberately does NOT carry a pre-assembled spkg. An
+ * earlier version did, but that reintroduced the same trust problem
+ * one layer down: signatures on the *commits* don't attest to what the
+ * coordinator packaged them into, so a corrupt coordinator could still
+ * hand out an spkg containing dummy/mismatched commitments alongside
+ * an otherwise-valid-looking bundle. Instead, every party -- coordinator
+ * and each signer -- independently invokes the same `frost_signer_core
+ * assemble` binary over the identical, now-verified (id, commit) list
+ * to derive its own spkg (see frost_assemble_signing_package() in
+ * frost_stubs.c). Since assemble is a pure function of its declared
+ * inputs, an honest signer's locally-derived spkg is guaranteed to
+ * reflect only the commitments it just authenticated -- nothing the
+ * coordinator supplies as "the spkg" is trusted at all.
+ *
+ * Wire format (all multi-byte integers big-endian uint16_t):
+ *   [n_entries]
+ *   entries[n_entries] each:
+ *     [id][commit_len][commit_len bytes commit][FROST_FRAME_SIG_SIZE bytes
+ * commit_sig] [tbs_len][tbs_len bytes tbs]
+ *
+ * FROST_COMMIT_ENTRY_MAX bounds an individual commitment's size (FROST
+ * nonce commitments are on the order of tens of bytes; 256 is generous
+ * headroom). Keeping this smaller than FROST_MAX_PAYLOAD is what keeps
+ * the whole bundle able to fit inside one frame for realistic t.
+ */
+#define FROST_COMMIT_ENTRY_MAX 256
+
+struct frost_commit_entry {
+  uint16_t id;
+  uint16_t commit_len;
+  uint8_t commit[FROST_COMMIT_ENTRY_MAX];
+  uint8_t commit_sig[FROST_FRAME_SIG_SIZE];
+};
+
+struct frost_commit_bundle {
+  uint16_t n_entries;
+  struct frost_commit_entry entries[FROST_MAX_SIGNERS];
+  uint16_t tbs_len;
+  uint8_t tbs[FROST_MAX_PAYLOAD];
+};
+
+/* Recommended scratch buffer size for the packed wire form. Callers
+ * should size their static/heap buffer with this macro rather than
+ * guessing, and must check the packed length against FROST_MAX_PAYLOAD
+ * before handing it to signer_send()/queue_to_coord(), since the frame
+ * layer will silently refuse anything larger. */
+#define FROST_COMMIT_BUNDLE_WIRE_MAX                                           \
+  (2 +                                                                         \
+   (size_t)FROST_MAX_SIGNERS *                                                 \
+       (2 + 2 + FROST_COMMIT_ENTRY_MAX + FROST_FRAME_SIG_SIZE) +               \
+   2 + FROST_MAX_PAYLOAD)
+
+static inline int
+frost_pack_commit_bundle(uint8_t *dst, size_t dst_cap,
+                         const struct frost_commit_bundle *b) {
+  size_t off = 0;
+
+  if (off + 2 > dst_cap)
+    return -1;
+  dst[off++] = (uint8_t)(b->n_entries >> 8);
+  dst[off++] = (uint8_t)(b->n_entries & 0xFF);
+
+  for (int i = 0; i < b->n_entries; i++) {
+    const struct frost_commit_entry *e = &b->entries[i];
+    if (off + 2 + 2 > dst_cap)
+      return -1;
+    dst[off++] = (uint8_t)(e->id >> 8);
+    dst[off++] = (uint8_t)(e->id & 0xFF);
+    dst[off++] = (uint8_t)(e->commit_len >> 8);
+    dst[off++] = (uint8_t)(e->commit_len & 0xFF);
+
+    if (e->commit_len > FROST_COMMIT_ENTRY_MAX)
+      return -1;
+    if (off + e->commit_len > dst_cap)
+      return -1;
+    memcpy(dst + off, e->commit, e->commit_len);
+    off += e->commit_len;
+
+    if (off + FROST_FRAME_SIG_SIZE > dst_cap)
+      return -1;
+    memcpy(dst + off, e->commit_sig, FROST_FRAME_SIG_SIZE);
+    off += FROST_FRAME_SIG_SIZE;
+  }
+
+  if (off + 2 > dst_cap)
+    return -1;
+  dst[off++] = (uint8_t)(b->tbs_len >> 8);
+  dst[off++] = (uint8_t)(b->tbs_len & 0xFF);
+  if (b->tbs_len > FROST_MAX_PAYLOAD || off + b->tbs_len > dst_cap)
+    return -1;
+  memcpy(dst + off, b->tbs, b->tbs_len);
+  off += b->tbs_len;
+
+  return (int)off;
+}
+
+static inline int frost_unpack_commit_bundle(const uint8_t *src, size_t src_len,
+                                             struct frost_commit_bundle *b) {
+  size_t off = 0;
+
+  if (off + 2 > src_len)
+    return -1;
+  b->n_entries = (uint16_t)(((uint16_t)src[off] << 8) | src[off + 1]);
+  off += 2;
+  if (b->n_entries > FROST_MAX_SIGNERS)
+    return -1;
+
+  for (int i = 0; i < b->n_entries; i++) {
+    struct frost_commit_entry *e = &b->entries[i];
+    if (off + 4 > src_len)
+      return -1;
+    e->id = (uint16_t)(((uint16_t)src[off] << 8) | src[off + 1]);
+    off += 2;
+    e->commit_len = (uint16_t)(((uint16_t)src[off] << 8) | src[off + 1]);
+    off += 2;
+
+    if (e->commit_len > FROST_COMMIT_ENTRY_MAX)
+      return -1;
+    if (off + e->commit_len > src_len)
+      return -1;
+    memcpy(e->commit, src + off, e->commit_len);
+    off += e->commit_len;
+
+    if (off + FROST_FRAME_SIG_SIZE > src_len)
+      return -1;
+    memcpy(e->commit_sig, src + off, FROST_FRAME_SIG_SIZE);
+    off += FROST_FRAME_SIG_SIZE;
+  }
+
+  if (off + 2 > src_len)
+    return -1;
+  b->tbs_len = (uint16_t)(((uint16_t)src[off] << 8) | src[off + 1]);
+  off += 2;
+  if (b->tbs_len > FROST_MAX_PAYLOAD || off + b->tbs_len > src_len)
+    return -1;
+  memcpy(b->tbs, src + off, b->tbs_len);
+  off += b->tbs_len;
+
+  return (int)off;
+}
 
 #endif /* FROST_COMMON_H */
 #pragma GCC diagnostic pop
