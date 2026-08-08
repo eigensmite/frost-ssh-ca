@@ -86,6 +86,14 @@ static uint8_t g_commit[FROST_MAX_PAYLOAD];
 static uint16_t g_commit_len = 0;
 static uint8_t g_commit_is_precomputed = 0;
 
+/* TBS bytes as announced by the most recent SIGN_REQ. Cached so that,
+ * at RELAY_COMMIT time, we can refuse to sign if the bundle's tbs
+ * doesn't match what we were actually asked about -- otherwise a
+ * corrupt coordinator could bind our live (single-use) nonce to a
+ * different message than the one we agreed to. */
+static uint8_t g_tbs[FROST_MAX_PAYLOAD];
+static uint16_t g_tbs_len = 0;
+
 /* Peer round-1 packages */
 static uint8_t g_peer_r1[FROST_MAX_SIGNERS][FROST_MAX_PAYLOAD];
 static uint16_t g_peer_r1_len[FROST_MAX_SIGNERS];
@@ -307,6 +315,14 @@ static int connect_to_coordinator(gnutls_certificate_credentials_t cred) {
     return -1;
   }
 
+  /* mTLS: `cred` (loaded by main() from certs/signer<id>.crt/key) is
+   * both our client certificate for this handshake AND the identity
+   * the coordinator now cross-checks against our claimed HELLO id
+   * (see verify_peer_tls_identity() in frost_stubs.c) -- nothing extra
+   * to configure here beyond what was already needed to *verify* the
+   * coordinator's server cert below. GnuTLS presents `cred`'s cert
+   * automatically once the server requests one via
+   * GNUTLS_CERT_REQUIRE.                                              */
   gnutls_init(&g_coord_sess, GNUTLS_CLIENT);
   gnutls_credentials_set(g_coord_sess, GNUTLS_CRD_CERTIFICATE, cred);
   gnutls_handshake_set_timeout(g_coord_sess, GNUTLS_DEFAULT_HANDSHAKE_TIMEOUT);
@@ -318,6 +334,20 @@ static int connect_to_coordinator(gnutls_certificate_credentials_t cred) {
   check_in(CP_TLS_HANDSHAKE);
   LOOP_CHECK(r, gnutls_handshake(g_coord_sess));
   check_out(CP_TLS_HANDSHAKE);
+  if (r >= 0) {
+    /* Confirm the coordinator actually asked for our certificate --
+     * i.e. that this connection is genuinely mutual, not a silent
+     * downgrade to server-only TLS that happened to still succeed
+     * because we sent a cert nobody required. Non-fatal: it's a
+     * configuration smell on the coordinator's side, not proof of a
+     * live attack, so we warn rather than abort an otherwise-valid
+     * session.                                                        */
+    if (!gnutls_certificate_client_get_request_status(g_coord_sess)) {
+      fprintf(stderr,
+              "signer: warning — coordinator did not request a client "
+              "certificate; this session is TLS, not mTLS\n");
+    }
+  }
   if (r < 0) {
     if (r == GNUTLS_E_CERTIFICATE_VERIFICATION_ERROR) {
       gnutls_datum_t out;
@@ -725,7 +755,7 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
      * [src_hi][src_lo][dst_hi][dst_lo][pkg bytes] */
     for (int i = 0; i < g_ref_peer_r1_count; i++) {
 
-      gnutls_pubkey_t pub = get_signer_pubkey(r2_ids[i]);
+      gnutls_pubkey_t pub = get_signer_pubkey_oaep(r2_ids[i]);
       if (!pub) {
         fprintf(stderr, "signer %u: no pubkey for signer %u, skipping\n",
                 g_my_id, r2_ids[i]);
@@ -926,6 +956,14 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
       }
     }
 
+    if (plen > FROST_MAX_PAYLOAD) {
+      fprintf(stderr, "signer %u: SIGN_REQ TBS too large — ignoring\n",
+              g_my_id);
+      return;
+    }
+    memcpy(g_tbs, payload, plen);
+    g_tbs_len = plen;
+
     printf("signer %u: SIGN_REQ (%u TBS bytes) — generating commit\n", g_my_id,
            plen);
 
@@ -964,12 +1002,118 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
       fprintf(stderr, "signer %u: RELAY_COMMIT but no key material\n", g_my_id);
       return;
     }
-    printf("signer %u: signing package (%u bytes) — producing share\n", g_my_id,
-           plen);
+
+    /* ── Verify the authenticated commit bundle before signing ──────
+     * This is the TS-UF-4 check: never sign off a commitment set we
+     * can't independently authenticate. See frost_common.h for the
+     * wire format and rationale. */
+    static struct frost_commit_bundle bundle;
+    if (frost_unpack_commit_bundle(payload, plen, &bundle) < 0) {
+      fprintf(stderr,
+              "signer %u: malformed session bundle — refusing to sign\n",
+              g_my_id);
+      return;
+    }
+
+    /* (a) exactly t entries, no duplicate ids */
+    if (bundle.n_entries != g_t) {
+      fprintf(stderr,
+              "signer %u: session bundle has %u entries, expected t=%u — "
+              "refusing to sign\n",
+              g_my_id, bundle.n_entries, g_t);
+      return;
+    }
+    for (int i = 0; i < bundle.n_entries; i++) {
+      for (int j = i + 1; j < bundle.n_entries; j++) {
+        if (bundle.entries[i].id == bundle.entries[j].id) {
+          fprintf(stderr,
+                  "signer %u: duplicate id %u in session bundle — refusing "
+                  "to sign\n",
+                  g_my_id, bundle.entries[i].id);
+          return;
+        }
+      }
+    }
+
+    /* (b) every entry authentically signed by its claimed owner, and
+     * (c) my own entry matches what I actually generated and cached. */
+    int saw_self = 0;
+    for (int i = 0; i < bundle.n_entries; i++) {
+      struct frost_commit_entry *e = &bundle.entries[i];
+      gnutls_pubkey_t peer_pubkey = get_signer_pubkey(e->id);
+      gnutls_datum_t entry_data = {.data = e->commit, .size = e->commit_len};
+      gnutls_datum_t entry_sig = {.data = e->commit_sig,
+                                  .size = FROST_FRAME_SIG_SIZE};
+
+      if (gnutls_pubkey_verify_data2(peer_pubkey, GNUTLS_SIGN_RSA_SHA256, 0,
+                                     &entry_data, &entry_sig) < 0) {
+        fprintf(stderr,
+                "signer %u: commitment from signer %u failed verification "
+                "— refusing to sign (possible coordinator tampering)\n",
+                g_my_id, e->id);
+        return;
+      }
+
+      if (e->id == g_my_id) {
+        saw_self = 1;
+        if (e->commit_len != g_commit_len ||
+            memcmp(e->commit, g_commit, g_commit_len) != 0) {
+          fprintf(stderr,
+                  "signer %u: my own commitment was altered in the session "
+                  "bundle — refusing to sign\n",
+                  g_my_id);
+          return;
+        }
+      }
+    }
+    if (!saw_self) {
+      fprintf(stderr,
+              "signer %u: session bundle does not include my own "
+              "commitment — refusing to sign\n",
+              g_my_id);
+      return;
+    }
+    fprintf(stdout, "signer %u: all %u signer commitment signatures verified\n",
+            g_my_id, bundle.n_entries);
+
+    /* (d) the message matches what SIGN_REQ actually told me — stops a
+     * corrupt coordinator from binding my single-use nonce to a
+     * different message than the one I approved. */
+    if (bundle.tbs_len != g_tbs_len ||
+        memcmp(bundle.tbs, g_tbs, g_tbs_len) != 0) {
+      fprintf(stderr,
+              "signer %u: TBS in session bundle does not match SIGN_REQ — "
+              "refusing to sign\n",
+              g_my_id);
+      return;
+    }
+
+    printf("signer %u: session bundle verified (%u signers, tbs matches) — "
+           "assembling signing package locally\n",
+           g_my_id, bundle.n_entries);
+
+    /* ── Derive spkg ourselves, from the bundle we just verified ─────
+     * Nothing the coordinator sends as "the signing package" is
+     * trusted: we invoke the same `frost_signer_core assemble`
+     * subcommand the coordinator uses, but over the (id, commit) pairs
+     * we just authenticated ourselves. assemble is a pure function of
+     * those inputs, so a coordinator cannot hand us a package built
+     * from different/dummy commitments while still passing bundle
+     * verification above -- there is no longer a separate spkg value
+     * for it to substitute. */
+    uint8_t spkg[FROST_MAX_PAYLOAD];
+    uint16_t spkg_len = 0;
+    if (frost_assemble_signing_package(&bundle, spkg, &spkg_len) != 0) {
+      fprintf(stderr,
+              "signer %u: failed to assemble signing package locally — "
+              "refusing to sign\n",
+              g_my_id);
+      return;
+    }
 
     uint8_t sig_share[FROST_MAX_PAYLOAD];
     uint16_t sig_share_len = 0;
-    if (frost_sign(g_my_id, payload, plen, g_nonces, g_nonces_len, g_key_pkg,
+    if (frost_sign(g_my_id, spkg, spkg_len, g_nonces, g_nonces_len, g_key_pkg,
                    g_key_pkg_len, sig_share, &sig_share_len) != 0) {
       fprintf(stderr, "signer %u: frost_sign failed\n", g_my_id);
       return;
