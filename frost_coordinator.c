@@ -138,6 +138,7 @@ static char g_dummy_cert[FROST_MAX_PAYLOAD];
 static struct roast_session g_sessions[ROAST_MAX_SESSIONS];
 static uint32_t g_next_session_id = 1;
 static int g_signing_done = 0;
+static int g_roast_fail = 0;
 
 /* Identifiable-abort blacklist */
 static uint16_t g_blacklist[FROST_MAX_SIGNERS];
@@ -169,6 +170,11 @@ static void add_strike(uint16_t id) {
   if (idx >= 0 && idx < FROST_MAX_SIGNERS)
     g_strikes[idx]++;
 }
+
+#define FAULT_REPLACE_TBS 1
+#define FAULT_NO_FAULT 0
+
+static int g_fault = FAULT_NO_FAULT;
 
 /* ══════════════════════════════════════════════════════════════════
  * Rust binary integration — tbs and mint
@@ -847,6 +853,27 @@ static void broadcast_sign_req(struct signerlist *list) {
   }
 }
 
+/* Outputs 1 if no eligible sessions remain (i.e. < t remaining signers)
+ * use with g_roast_fail = roast_do_no_eligible_remain(...) to set exit flag
+ */
+static int roast_do_no_eligible_remain(struct signerlist *list) {
+  /* Check we still have enough eligible signers */
+  int remaining = 0;
+  {
+    struct signer *sg, *tmp;
+    LIST_FOREACH_SAFE(sg, list, entries, tmp)
+    if (!is_blacklisted(sg->id) && sg->sign_phase != SPHASE_NO_KEY)
+      remaining++;
+  }
+  if (remaining < (int)g_t) {
+    fprintf(stderr,
+            "coordinator: [ROAST] only %d signer(s) remain — signing FAILED\n",
+            remaining);
+    return 1;
+  }
+  return 0;
+}
+
 /*  Form one ROAST session from the first t SPHASE_COMMITTED, non-blacklisted
  *  signers.  Calls frost_signer_core assemble to build a signing package
  *  for that specific subset, then sends it to each member.
@@ -855,12 +882,6 @@ static void broadcast_sign_req(struct signerlist *list) {
 static int roast_try_form_session(struct signerlist *list) {
   if (g_signing_done)
     return 0;
-
-  struct roast_session *sess = roast_alloc();
-  if (!sess) {
-    printf("coordinator: [ROAST] no free session slots\n");
-    return 0;
-  }
 
   /* ── Two-pass selection ─────────────────────────────────────────
    * Pass 1: zero-strike committed signers  (proven reliable)
@@ -871,9 +892,11 @@ static int roast_try_form_session(struct signerlist *list) {
   int n_chosen = 0;
   check_in(CP_ROAST_FORM_SESSION);
 
+  int num_signers = 0;
   struct signer *sg, *tmp;
   /* Pass 1 — reliable (zero strikes, SPHASE_COMMITTED) */
   LIST_FOREACH_SAFE(sg, list, entries, tmp) {
+    num_signers++;
     if (n_chosen >= (int)g_t)
       break;
     if (sg->sign_phase == SPHASE_COMMITTED && !is_blacklisted(sg->id) &&
@@ -906,8 +929,26 @@ static int roast_try_form_session(struct signerlist *list) {
   }
 
   check_out(CP_ROAST_FORM_SESSION);
-  if (n_chosen < (int)g_t)
+
+  if (num_signers < g_t) {
+    printf("coordinator: [ROAST] only %d signers connected, deferring session "
+           "forming\n",
+           num_signers);
+
     return 0;
+  }
+
+  if (n_chosen < (int)g_t) {
+    // it seems not enough eligible signers remain
+    // g_roast_fail = roast_do_no_eligible_remain(list);
+    return 0;
+  }
+
+  struct roast_session *sess = roast_alloc();
+  if (!sess) {
+    printf("coordinator: [ROAST] no free session slots\n");
+    return 0;
+  }
 
   int r = 0;
   for (int ci = 0; ci < n_chosen; ci++)
@@ -959,7 +1000,14 @@ static int roast_try_form_session(struct signerlist *list) {
     return 0;
   }
   bundle.tbs_len = (uint16_t)g_tbs_len;
+
   memcpy(bundle.tbs, g_tbs, g_tbs_len);
+
+  if (g_fault == FAULT_REPLACE_TBS) {
+    fprintf(stderr, "coordinator: [FAULT] replace-tbs Maliciously changing tbs "
+                    "data after soliciting commitments\n");
+    bundle.tbs[bundle.tbs_len / 2] ^= 0xFF;
+  } // FAULT
 
   /* The coordinator still needs its own spkg for the later aggregation
    * step (sess->signing_pkg, used by roast_try_aggregate()). It derives
@@ -1075,23 +1123,10 @@ static void roast_fail_culprit(struct signerlist *list,
     }
   }
 
-  /* Check we still have enough eligible signers */
-  int remaining = 0;
-  {
-    struct signer *sg, *tmp;
-    LIST_FOREACH_SAFE(sg, list, entries, tmp)
-    if (!is_blacklisted(sg->id) && sg->sign_phase != SPHASE_NO_KEY)
-      remaining++;
-  }
-  if (remaining < (int)g_t) {
-    fprintf(stderr,
-            "coordinator: [ROAST] only %d signer(s) remain — signing FAILED\n",
-            remaining);
-    g_signing_done = 1;
-    return;
-  }
   if (!g_signing_done && roast_active_count() < ROAST_MAX_SESSIONS)
     roast_try_form_session(list);
+
+  g_roast_fail = roast_do_no_eligible_remain(list);
 }
 
 /*  Try to aggregate shares for session `sess`.
@@ -1235,6 +1270,9 @@ session_fail:;
     if (!is_blacklisted(sg->id) && sg->sign_phase != SPHASE_NO_KEY)
       remaining++;
   }
+
+  printf("remaining: %d\n", remaining);
+
   if (remaining < (int)g_t) {
     fprintf(stderr, "coordinator: [ROAST] only %d remain — FAILED\n",
             remaining);
@@ -1461,7 +1499,8 @@ static void process_signer_frame(struct signerlist *list, struct signer *sg,
       fprintf(stdout,
               "All signer pub_key_pkgs verified... saving pub key file.\n");
     }
-    /* Payload = new PublicKeyPackage hex bytes (raw, not hex-encoded again) */
+    /* Payload = new PublicKeyPackage hex bytes (raw, not hex-encoded again)
+     */
     if (g_pub_key_pkg_len == 0 && plen > 0) {
       /* Save updated pub_key_pkg from the first signer that reports */
       memcpy(g_pub_key_pkg, payload, plen);
@@ -1725,9 +1764,27 @@ int main(int argc, char **argv) {
       g_validity_secs = (uint64_t)atol(argv[++i]);
     } else if (!strcmp(argv[i], "--mass-mint") && i + 1 < argc) {
       g_to_mint = (uint64_t)atol(argv[++i]);
+    } else if (!strcmp(argv[i], "--fault") && i + 1 < argc) {
+      i++;
+      continue;
     } else {
       fprintf(stderr, "coordinator: unknown option '%s'\n", argv[i]);
       return EXIT_FAILURE;
+    }
+  }
+
+  /* optional fault injection */
+  for (int i = 2; i < argc; i++) {
+    if (!strcmp(argv[i], "--fault") && i + 1 < argc) {
+      i++;
+      if (!strcmp(argv[i], "replace-tbs"))
+        g_fault = FAULT_REPLACE_TBS;
+      else {
+        fprintf(stderr, "unknown fault mode '%s'\n", argv[i]);
+        fprintf(stderr, "Try replace-tbs\n");
+        return EXIT_FAILURE;
+      }
+      printf("coordinator: *** FAULT INJECTION MODE: %s ***\n", argv[i]);
     }
   }
 
@@ -1858,6 +1915,9 @@ int main(int argc, char **argv) {
 
   /* Event loop */
   for (;;) {
+    if (g_roast_fail) {
+      goto exit;
+    }
     /* In sign mode, exit once signing is complete and all queues flushed */
     if (g_signing_done && g_mode == COORD_MODE_SIGN) {
       if (g_to_mint > 0) {
@@ -1869,6 +1929,7 @@ int main(int argc, char **argv) {
         g_signing_done = 0;
         broadcast_sign_req(&signers);
       } else {
+      exit:;
         int all_quiet = 1;
         struct signer *sg, *tmp;
         LIST_FOREACH_SAFE(sg, &signers, entries, tmp)
@@ -1937,8 +1998,9 @@ int main(int argc, char **argv) {
     }
 
     /* Periodic: expire timed-out ROAST sessions */
-    if (g_mode == COORD_MODE_SIGN && !g_signing_done)
+    if (g_mode == COORD_MODE_SIGN && !g_signing_done) {
       roast_expire_sessions(&signers);
+    }
 
     if (sel == 0)
       continue;
@@ -1978,9 +2040,10 @@ int main(int argc, char **argv) {
         if (r == GNUTLS_E_CERTIFICATE_VERIFICATION_ERROR) {
           gnutls_datum_t out;
           unsigned status = gnutls_session_get_verify_cert_status(sess);
-          gnutls_certificate_verification_status_print(
-              status, GNUTLS_CRT_X509, &out, 0);
-          fprintf(stderr, "coordinator: client cert verify failure from %s: %s\n",
+          gnutls_certificate_verification_status_print(status, GNUTLS_CRT_X509,
+                                                       &out, 0);
+          fprintf(stderr,
+                  "coordinator: client cert verify failure from %s: %s\n",
                   inet_ntoa(cli.sin_addr), out.data);
           gnutls_free(out.data);
         } else {
@@ -2085,8 +2148,8 @@ int main(int argc, char **argv) {
         char ebuf[64];
         int elen = snprintf(ebuf, sizeof(ebuf),
                             "no certs/signer%u.crt on coordinator", pid);
-        fprintf(stderr,
-                "coordinator: can't verify claimed id %u — %s\n", pid, ebuf);
+        fprintf(stderr, "coordinator: can't verify claimed id %u — %s\n", pid,
+                ebuf);
         staged_send(st, FROST_MSG_ERROR, (uint8_t *)ebuf, (uint16_t)elen);
         continue;
       }
@@ -2166,7 +2229,8 @@ int main(int argc, char **argv) {
       printf("coordinator: signer %u registered (n=%u t=%u) from %s\n",
              new_sg->id, g_n, g_t, inet_ntoa(new_sg->addr.sin_addr));
 
-      /* HELLO_ACK: include mode character so signer knows to load from disk */
+      /* HELLO_ACK: include mode character so signer knows to load from disk
+       */
       char ackbuf[32];
       int acklen = snprintf(ackbuf, sizeof(ackbuf), "ACK %u %c\n", new_sg->id,
                             g_mode == COORD_MODE_DKG    ? 'D'

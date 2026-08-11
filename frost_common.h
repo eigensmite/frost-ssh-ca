@@ -71,7 +71,7 @@
 #define FROST_PUB_PKG_HEX "pub_key_pkg.hex"
 
 /* ── ROAST session tuning ─────────────────────────────────────── */
-#define ROAST_MAX_SESSIONS 16
+#define ROAST_MAX_SESSIONS 64
 #define ROAST_SESSION_TIMEOUT_SEC 10
 
 /* ── Checkpoint enum ids ──────────────────────────────────────── */

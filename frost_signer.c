@@ -245,8 +245,35 @@ static int load_key_material(void) {
  * Network helpers
  * ══════════════════════════════════════════════════════════════════ */
 
-static void queue_to_coord(frost_msg_t type, const uint8_t *payload,
-                           uint16_t plen) {
+/* Build the exact byte buffer that gets signed/verified for a commitment:
+ *   [ 2-byte BE tbs_len | tbs bytes | commit bytes ]
+ * Length-prefixing tbs prevents any ambiguity from where the tbs/commit
+ * split falls (a plain concatenation could in principle let two different
+ * (tbs, commit) pairs hash/sign to the same bytes if boundaries were
+ * movable; the explicit length field removes that degree of freedom).
+ * Returns the number of bytes written, or -1 if `out` is too small.
+ */
+static int build_commit_sign_buf(const uint8_t *tbs, uint16_t tbs_len,
+                                 const uint8_t *commit, uint16_t commit_len,
+                                 uint8_t *out, size_t out_max) {
+  size_t need = 2u + (size_t)tbs_len + (size_t)commit_len;
+  if (need > out_max)
+    return -1;
+  out[0] = (uint8_t)(tbs_len >> 8);
+  out[1] = (uint8_t)(tbs_len & 0xFF);
+  memcpy(out + 2, tbs, tbs_len);
+  memcpy(out + 2 + tbs_len, commit, commit_len);
+  return (int)need;
+}
+
+/* Like queue_to_coord(), but signs `sign_buf` (which may differ from the
+ * bytes actually transmitted as `payload`) instead of signing `payload`
+ * itself. Used for FROST_MSG_COMMIT so the signature binds the commitment
+ * to the specific message it was generated for, without needing to
+ * retransmit the message alongside every commitment on the wire. */
+static void queue_to_coord_signed(frost_msg_t type, const uint8_t *sign_buf,
+                                  uint16_t sign_len, const uint8_t *payload,
+                                  uint16_t plen) {
   struct outmsg *m = malloc(sizeof(*m));
   if (!m)
     return;
@@ -258,7 +285,7 @@ static void queue_to_coord(frost_msg_t type, const uint8_t *payload,
     return;
   }
 
-  gnutls_datum_t data = {.data = (unsigned char *)payload, .size = plen};
+  gnutls_datum_t data = {.data = (unsigned char *)sign_buf, .size = sign_len};
   gnutls_datum_t sig; // MUST FREE
   if (gnutls_privkey_sign_data2(my_priv, GNUTLS_SIGN_RSA_SHA256, 0, &data,
                                 &sig) < 0) {
@@ -270,6 +297,12 @@ static void queue_to_coord(frost_msg_t type, const uint8_t *payload,
   TAILQ_INSERT_TAIL(&g_outq, m, entries);
 
   gnutls_free(sig.data);
+}
+
+static void queue_to_coord(frost_msg_t type, const uint8_t *payload,
+                           uint16_t plen) {
+  /* Default behavior: sign exactly the bytes being sent. */
+  queue_to_coord_signed(type, payload, plen, payload, plen);
 }
 
 static int drain_outq(void) {
@@ -980,7 +1013,31 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
         return;
       }
     }
-    queue_to_coord(FROST_MSG_COMMIT, g_commit, g_commit_len);
+    /* Sign (tbs || commit), not the commitment alone. This is what lets
+     * every OTHER signer in the group -- not just this signer's own
+     * self-check further down at RELAY_COMMIT time -- cryptographically
+     * detect a coordinator that tries to reuse this genuine, validly
+     * signed commitment against a different message than the one it was
+     * actually generated for (e.g. to pool commitments harvested across
+     * concurrent sessions into a single Wagner-style forgery search).
+     * Without this, the commit_sig proves only "signer i produced this
+     * commitment value", not "for this message" -- so any party other
+     * than signer i itself has no way to catch a mismatched rebinding. */
+    {
+      uint8_t sign_buf[2 * FROST_MAX_PAYLOAD + 4];
+      int sign_len = build_commit_sign_buf(g_tbs, g_tbs_len, g_commit,
+                                           g_commit_len, sign_buf,
+                                           sizeof(sign_buf));
+      if (sign_len < 0) {
+        fprintf(stderr,
+                "signer %u: tbs+commit too large to sign — refusing to "
+                "send COMMIT\n",
+                g_my_id);
+        return;
+      }
+      queue_to_coord_signed(FROST_MSG_COMMIT, sign_buf, (uint16_t)sign_len,
+                            g_commit, g_commit_len);
+    }
     g_commit_is_precomputed = 0;
     printf("signer %u: sent COMMIT (%u bytes)\n", g_my_id, g_commit_len);
     break;
@@ -1035,13 +1092,40 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
       }
     }
 
-    /* (b) every entry authentically signed by its claimed owner, and
-     * (c) my own entry matches what I actually generated and cached. */
+    /* (b) every entry authentically signed by its claimed owner FOR
+     * bundle.tbs specifically, and (c) my own entry matches what I
+     * actually generated and cached.
+     *
+     * The signature check reconstructs the same (tbs || commit) buffer
+     * the owning signer signed in the SIGN_REQ handler and verifies
+     * against THAT, not against the bare commitment. This means a
+     * coordinator cannot take a genuine (commit, commit_sig) pair that
+     * signer e->id produced for some other message and splice it into a
+     * bundle for bundle.tbs: the reconstructed buffer here would use
+     * bundle.tbs, which won't match what e->id actually signed, so
+     * verification fails for THAT entry, regardless of what the
+     * verifying signer's own tbs happens to be. Every signer in the
+     * group can now catch a mismatched-message replay of any peer's
+     * commitment, not just its own. */
     int saw_self = 0;
     for (int i = 0; i < bundle.n_entries; i++) {
       struct frost_commit_entry *e = &bundle.entries[i];
       gnutls_pubkey_t peer_pubkey = get_signer_pubkey(e->id);
-      gnutls_datum_t entry_data = {.data = e->commit, .size = e->commit_len};
+
+      uint8_t verify_buf[2 * FROST_MAX_PAYLOAD + 4];
+      int verify_len =
+          build_commit_sign_buf(bundle.tbs, bundle.tbs_len, e->commit,
+                                e->commit_len, verify_buf,
+                                sizeof(verify_buf));
+      if (verify_len < 0) {
+        fprintf(stderr,
+                "signer %u: bundle entry from signer %u too large to "
+                "verify — refusing to sign\n",
+                g_my_id, e->id);
+        return;
+      }
+      gnutls_datum_t entry_data = {.data = verify_buf,
+                                   .size = (unsigned int)verify_len};
       gnutls_datum_t entry_sig = {.data = e->commit_sig,
                                   .size = FROST_FRAME_SIG_SIZE};
 
@@ -1049,7 +1133,9 @@ static void process_coord_frame(frost_msg_t type, const gnutls_datum_t sig,
                                      &entry_data, &entry_sig) < 0) {
         fprintf(stderr,
                 "signer %u: commitment from signer %u failed verification "
-                "— refusing to sign (possible coordinator tampering)\n",
+                "against this bundle's message — refusing to sign "
+                "(possible coordinator tampering or cross-session "
+                "commitment reuse)\n",
                 g_my_id, e->id);
         return;
       }
