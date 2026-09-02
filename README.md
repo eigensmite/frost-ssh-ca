@@ -221,7 +221,9 @@ and thousands of certificates per day comfortably feasible.
 | `certs/` | mTLS and OAEP keypairs |
 | `Makefile` | Builds the Rust core via Cargo, then the C coordinator and signer |
 | `user_key` | Sample SSH user key attached to SSH CA cert by default (default path is `./user_key`, use flag `--user_key <PATH>` or replace with your own key) |
-#### > **IMPORTANT NOTE FOR REVIEWERS**: `user_key` is used to provide an example of functionality and corresponds to a client SSH privkey. It has NO cryptographic role in frost-ssh-ca. It is provided purely for easy of cert minting demonstration
+> [!IMPORTANT]
+> `user_key` exists only to demonstrate cert minting. It corresponds to a
+> client SSH private key and has no cryptographic role in `frost-ssh-ca`.
 
 ## Limitations
 
