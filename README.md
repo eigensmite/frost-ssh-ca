@@ -1,12 +1,65 @@
 # frost-ssh-ca
-FROST DKG-based SSH CA master key virtualization 
 
-build rust frost tool with `cargo` in frost_signer_core
+Repository: https://github.com/eigensmite/frost-ssh-ca
 
-make coordinator and signer with `make`
+## Build
 
-run single coordinator with `./frost_coordinator`
+1. Build the Rust FROST core:
 
-run up to `n` signers with `./frost_signer <cert.crt> <key.pem> <t> <n>`
+   ```bash
+   cd frost_signer_core && cargo build
+   ```
 
-after handshake / DKG complete, use `SIGN <m>` in `frost_coordinator` terminal to sign `m`.
+2. Build the coordinator and signer binaries:
+
+   ```bash
+   make
+   ```
+
+3. (Optional) Regenerate certs/keypairs if required:
+
+   ```bash
+   ./gen_tls_certs.sh
+   ```
+
+## Running
+
+### Start the coordinator
+
+Start a single coordinator process:
+
+```bash
+./frost_coordinator <dkg/sign/refresh> [--t <t>] [--n <n>] [--principal <name>]
+```
+
+### Start the signers
+
+Start up to `n` signer processes, each as:
+
+```bash
+./frost_signer <id> <t> <n>
+```
+
+To automate launching all signers at once:
+
+```bash
+N=<n>; T=<t>
+for i in $(seq 1 $N); do
+  ./frost_signer $i $N $T &
+done
+```
+
+## Usage Notes
+
+- Perform a **DKG** operation first to generate the key share material.
+- To perform a **signing** operation:
+  - You must specify a `user_key.pub`, or have one present in the directory under that name.
+  - You must specify the `--principal`.
+
+## Extracting the SSH-Compatible Pubkey
+
+Extract an SSH-compatible Ed25519 public key with:
+
+```bash
+cat ./pub_key_pkg.hex | /frost_signer_core/target/debug/frost_signer_core pubkey > ca.pub
+```
