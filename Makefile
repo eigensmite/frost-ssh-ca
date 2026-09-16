@@ -12,7 +12,9 @@
 CC      = gcc
 CFLAGS  = -g -std=c99 -Wall -Wextra -Wpedantic \
            -Wno-unused-function -Wno-unused-variable \
-           -Wno-missing-field-initializers
+           -Wno-missing-field-initializers \
+           -I/usr/local/include -L/usr/local/lib \
+           -Wl,-rpath,/usr/local/lib
 LDFLAGS = -lgnutls
 
 # Path to the compiled Rust FROST core binary.
