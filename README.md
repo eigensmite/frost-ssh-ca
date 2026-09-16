@@ -103,6 +103,7 @@ Requires a Rust toolchain (Cargo), a C compiler, and OpenSSL.
 ```sh
 cd frost_signer_core && cargo build && cd ..
 make
+ssh-keygen -t ed25519 -f user_key -N "" -C "sample user key" # create SSH client key
 ./gen_tls_certs.sh          # regenerate mTLS + OAEP keypairs if needed
 ```
 
